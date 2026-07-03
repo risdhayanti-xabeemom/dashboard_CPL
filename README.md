@@ -49,22 +49,26 @@ Kolom:
 
 Kolom:
 
+- `Kode CPL`
 - `Kode IK`
 - `Rumusan IK`
-- `Kode CPL`
+- `Notasi IK`
 
 ### Mapping_CPMK
 
 Kolom:
 
+- `Tahun Akademik`
 - `Semester`
 - `Kode MK`
 - `Mata Kuliah`
 - `Kode CPMK`
 - `Rumusan CPMK`
-- `Kode IK`
 - `Kode CPL`
+- `Kode IK`
 - `Bobot CPMK`
+- `Komponen Asesmen`
+- `Bobot Komponen`
 
 Kolom `Semester` pada file lama tetap berarti semester mata kuliah. Pada rekap multi-semester, aplikasi menambahkan metadata periode asesmen dan menyimpan semester mata kuliah sebagai `Semester MK`.
 
@@ -72,12 +76,39 @@ Kolom `Semester` pada file lama tetap berarti semester mata kuliah. Pada rekap m
 
 Kolom:
 
-- `NIM`
-- `Nama Mahasiswa`
+- `Tahun Akademik`
+- `Semester`
 - `Kode MK`
 - `Mata Kuliah`
 - `Kode CPMK`
+- `Kode CPL`
+- `Kode IK`
+- `NIM`
+- `Nama Mahasiswa`
 - `Nilai`
+
+`Nilai_CPMK` tetap menjadi sumber utama perhitungan capaian CPMK, IK, CPL, radar CPL, dan CQI.
+
+### Nilai_Asesmen_Detail Opsional
+
+Sheet opsional `Nilai_Asesmen_Detail` dapat digunakan untuk drill-down komponen asesmen tanpa menggandakan perhitungan utama. Kolom yang didukung:
+
+- `Tahun Akademik`
+- `Semester`
+- `Kode MK`
+- `Mata Kuliah`
+- `Kode CPMK`
+- `Kode CPL`
+- `Kode IK`
+- `Notasi IK`
+- `Komponen`
+- `NIM`
+- `Nama Mahasiswa`
+- `Nilai`
+- `Bobot Komponen`
+- `Label Jadwal Asesmen`
+
+Komponen yang dikenali: `Tugas`, `Quiz`, `CM`, `PBL/Produk`, `UTS`, `UAS`, `PBL/Praktik Kerja`, `Ujian Magang`, `Ujian Akhir`. Variasi `Kuis` dibaca sebagai `Quiz`, dan `PBL` dibaca sebagai `PBL/Produk`.
 
 ### Target
 
@@ -88,8 +119,10 @@ Kolom:
 
 Parameter yang digunakan:
 
-- `Batas Nilai Minimum`, contoh `70`
-- `Target Ketercapaian CPL`, contoh `70`
+- `Batas Nilai Minimum IK`, contoh `70`
+- `Target Pemenuhan CPL (%)`, contoh `70`
+
+Nama parameter lama `Batas Nilai Minimum` dan `Target Ketercapaian CPL` tetap didukung.
 
 ## Mode Single Semester
 

@@ -1829,9 +1829,14 @@ def apply_workbook_filters(data: Dict[str, pd.DataFrame], filters: Dict[str, Lis
 
 def load_default_sample() -> Optional[Dict[str, pd.DataFrame]]:
     try:
-        return read_workbook("sample_data.xlsx")
-    except FileNotFoundError:
-        return make_sample_data()
+        sample_data = read_workbook("sample_data.xlsx")
+        return sample_data
+    except (FileNotFoundError, ValueError):
+        st.warning("Default sample data belum tersedia atau belum valid. Silakan upload file Excel.")
+        return None
+    except Exception:
+        st.warning("Default sample data belum tersedia atau belum valid. Silakan upload file Excel.")
+        return None
 
 
 def render_download_buttons_single(
@@ -2139,9 +2144,27 @@ def render_single_mode() -> None:
         sidebar_section("Upload Data")
         uploaded_file = st.file_uploader("Upload file Excel", type=["xlsx"], key="single_upload")
 
-    raw_data = read_workbook(uploaded_file) if uploaded_file is not None else load_default_sample()
+    if uploaded_file is not None:
+        try:
+            raw_data = read_workbook(uploaded_file)
+        except ValueError as exc:
+            st.error("File Excel belum sesuai.")
+            st.write(str(exc))
+            render_guide()
+            return
+        except Exception as exc:
+            st.error("File Excel tidak dapat dibaca.")
+            st.write(f"Detail: {exc}")
+            render_guide()
+            return
+    else:
+        raw_data = load_default_sample()
+
     if raw_data is None:
-        st.warning("Upload file Excel asesmen atau letakkan `sample_data.xlsx` di folder aplikasi.")
+        st.info(
+            "Upload file Excel asesmen untuk mulai. Dashboard menerima format dashboard-ready, "
+            "`Input_Normalisasi`, atau format wide `GANJIL`/`GENAP`."
+        )
         render_guide()
         return
 

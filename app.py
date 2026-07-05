@@ -23,7 +23,6 @@ REQUIRED_SHEETS = {
         "Kode MK",
         "Mata Kuliah",
         "Kode CPMK",
-        "Rumusan CPMK",
         "Kode CPL",
         "Kode IK",
         "Bobot CPMK",
@@ -49,16 +48,23 @@ BASE_REQUIRED_COLUMNS = {
     "Master_CPL": ["Kode CPL", "Rumusan CPL", "GA IABEE"],
     "Master_IK": ["Kode CPL", "Kode IK", "Rumusan IK"],
     "Mapping_CPMK": [
-        "Semester",
         "Kode MK",
         "Mata Kuliah",
         "Kode CPMK",
-        "Rumusan CPMK",
         "Kode CPL",
         "Kode IK",
         "Bobot CPMK",
     ],
-    "Nilai_CPMK": ["NIM", "Nama Mahasiswa", "Kode MK", "Mata Kuliah", "Kode CPMK", "Nilai"],
+    "Nilai_CPMK": [
+        "Kode MK",
+        "Mata Kuliah",
+        "Kode CPMK",
+        "Kode CPL",
+        "Kode IK",
+        "NIM",
+        "Nama Mahasiswa",
+        "Nilai",
+    ],
     "Target": ["Parameter", "Nilai"],
 }
 
@@ -80,6 +86,17 @@ OPTIONAL_SHEETS = {
         "Label Jadwal Asesmen",
     ]
 }
+
+INPUT_NORMALISASI_REQUIRED = [
+    "Tahun Akademik",
+    "Semester",
+    "Kelas",
+    "NIM",
+    "Nama Mahasiswa",
+    "Kode MK",
+    "Mata Kuliah",
+    "CPMK1",
+]
 
 ACCEPTED_COMPONENTS = [
     "Tugas",
@@ -141,6 +158,7 @@ COLUMN_ALIASES = {
     "notasi ik": "Notasi IK",
     "tahun akademik": "Tahun Akademik",
     "semester": "Semester",
+    "kelas": "Kelas",
     "kode mk": "Kode MK",
     "mata kuliah": "Mata Kuliah",
     "nama mata kuliah": "Mata Kuliah",
@@ -153,6 +171,10 @@ COLUMN_ALIASES = {
     "nim": "NIM",
     "nama mahasiswa": "Nama Mahasiswa",
     "nilai": "Nilai",
+    "rata-rata": "Rata-rata",
+    "rata rata": "Rata-rata",
+    "rerata": "Rata-rata",
+    "nilai huruf": "Nilai Huruf",
     "parameter": "Parameter",
     "label jadwal asesmen": "Label Jadwal Asesmen",
 }
@@ -404,10 +426,343 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned.dropna(how="all")
 
 
+def read_sheet_auto_header(file_obj, sheet_name: str, required_cols: List[str]) -> pd.DataFrame:
+    preview = pd.read_excel(file_obj, sheet_name=sheet_name, header=None, nrows=5, engine="openpyxl")
+    required = {canonical_column_name(column) for column in required_cols}
+    for row_index, row in preview.iterrows():
+        detected = {
+            canonical_column_name(value)
+            for value in row.tolist()
+            if not pd.isna(value) and str(value).strip()
+        }
+        if required.issubset(detected):
+            sheet = pd.read_excel(file_obj, sheet_name=sheet_name, header=row_index, engine="openpyxl")
+            return clean_dataframe(sheet)
+
+    raise ValueError(
+        f"Sheet '{sheet_name}' tidak menemukan baris header pada 5 baris pertama. "
+        f"Kolom wajib yang dicari: {', '.join(required_cols)}."
+    )
+
+
+def read_optional_sheet_auto_header(file_obj, sheet_name: str, required_cols: List[str]) -> pd.DataFrame:
+    try:
+        return read_sheet_auto_header(file_obj, sheet_name, required_cols)
+    except ValueError:
+        return clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl"))
+
+
 def read_workbook(file_obj) -> Dict[str, pd.DataFrame]:
-    workbook = pd.read_excel(file_obj, sheet_name=None, engine="openpyxl")
-    cleaned = {str(sheet).strip(): clean_dataframe(df) for sheet, df in workbook.items()}
+    workbook = pd.ExcelFile(file_obj, engine="openpyxl")
+    sheet_names = {str(sheet).strip(): sheet for sheet in workbook.sheet_names}
+    cleaned: Dict[str, pd.DataFrame] = {}
+    messages: List[str] = []
+
+    for sheet_name, required_cols in BASE_REQUIRED_COLUMNS.items():
+        if sheet_name in sheet_names:
+            cleaned[sheet_name] = read_sheet_auto_header(workbook, sheet_names[sheet_name], required_cols)
+
+    for sheet_name, required_cols in OPTIONAL_SHEETS.items():
+        if sheet_name in sheet_names:
+            cleaned[sheet_name] = read_optional_sheet_auto_header(workbook, sheet_names[sheet_name], required_cols)
+
+    for normalized_name, original_name in sheet_names.items():
+        if normalized_name in cleaned:
+            continue
+        if normalized_name == "Input_Normalisasi":
+            cleaned[normalized_name] = read_optional_sheet_auto_header(
+                workbook, original_name, INPUT_NORMALISASI_REQUIRED
+            )
+        elif normalized_name in {"GANJIL", "GENAP"}:
+            cleaned[normalized_name] = read_any_sheet(workbook, original_name)
+        else:
+            cleaned[normalized_name] = clean_dataframe(pd.read_excel(workbook, sheet_name=original_name, engine="openpyxl"))
+
+    if all(sheet in cleaned for sheet in REQUIRED_SHEETS):
+        messages.append("Format dashboard-ready terdeteksi.")
+
+    if "Input_Normalisasi" in cleaned:
+        normalized_input, missing_mapping = convert_input_normalisasi(cleaned["Input_Normalisasi"], cleaned.get("Mapping_CPMK"))
+        cleaned["Nilai_CPMK"] = normalized_input
+        cleaned["_Missing_Mapping"] = missing_mapping
+        messages.append("Format Input_Normalisasi terdeteksi dan berhasil dikonversi.")
+
+    wide_sheets = [sheet for sheet in ["GANJIL", "GENAP"] if sheet in sheet_names]
+    if wide_sheets:
+        wide_result, nilai_mk_asli = convert_wide_2023_2024(workbook, sheet_names, cleaned.get("Mapping_CPMK"))
+        if not wide_result.empty:
+            cleaned["Nilai_CPMK"] = wide_result
+            cleaned["Nilai_MK_Asli"] = nilai_mk_asli
+            wide_missing = (
+                wide_result[wide_result["Kode CPL"].isna() | (wide_result["Kode CPL"].astype(str).str.strip() == "")]
+                [["Kode MK", "Mata Kuliah", "Kode CPMK"]]
+                .drop_duplicates()
+                .reset_index(drop=True)
+            )
+            if not wide_missing.empty:
+                if "_Missing_Mapping" in cleaned and not cleaned["_Missing_Mapping"].empty:
+                    cleaned["_Missing_Mapping"] = pd.concat(
+                        [cleaned["_Missing_Mapping"], wide_missing], ignore_index=True
+                    ).drop_duplicates()
+                else:
+                    cleaned["_Missing_Mapping"] = wide_missing
+            messages.append("Format wide 2023/2024 terdeteksi dan berhasil dikonversi.")
+
+    if messages:
+        cleaned["_Format_Info"] = pd.DataFrame({"Pesan": messages})
+
     return normalize_input_workbook(cleaned)
+
+
+def read_any_sheet(file_obj, sheet_name: str) -> pd.DataFrame:
+    return clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl"))
+
+
+def find_column(df: pd.DataFrame, name: str) -> Optional[str]:
+    wanted = canonical_column_name(name)
+    for column in df.columns:
+        if canonical_column_name(column) == wanted:
+            return column
+    return None
+
+
+def prepare_mapping_lookup(mapping: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if mapping is None or mapping.empty:
+        return pd.DataFrame(columns=["Kode MK", "Mata Kuliah", "Kode CPMK", "Kode CPL", "Kode IK", "Notasi IK"])
+    lookup = clean_dataframe(mapping.copy())
+    if "Notasi IK" not in lookup.columns:
+        lookup["Notasi IK"] = lookup.get("Kode IK", "")
+    for column in ["Kode MK", "Kode CPMK"]:
+        if column in lookup.columns:
+            lookup[column] = lookup[column].map(normalize_code)
+    if "Kode CPMK" in lookup.columns:
+        lookup["Kode CPMK"] = lookup["Kode CPMK"].astype(str).str.replace(" ", "", regex=False)
+    keep = [column for column in ["Kode MK", "Mata Kuliah", "Kode CPMK", "Kode CPL", "Kode IK", "Notasi IK"] if column in lookup.columns]
+    return lookup[keep].drop_duplicates(subset=[column for column in ["Kode MK", "Kode CPMK"] if column in keep])
+
+
+def convert_input_normalisasi(input_df: pd.DataFrame, mapping: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = clean_dataframe(input_df)
+    cpmk_columns = [column for column in df.columns if re.fullmatch(r"CPMK\s*[1-6]", str(column).strip(), re.IGNORECASE)]
+    id_columns = [
+        "Tahun Akademik",
+        "Semester",
+        "Kelas",
+        "NIM",
+        "Nama Mahasiswa",
+        "Kode MK",
+        "Mata Kuliah",
+        "Rata-rata",
+        "Nilai Huruf",
+    ]
+    for column in id_columns:
+        if column not in df.columns:
+            df[column] = ""
+
+    long_df = df.melt(
+        id_vars=id_columns,
+        value_vars=cpmk_columns,
+        var_name="Kode CPMK",
+        value_name="Nilai",
+    )
+    long_df["Nilai"] = pd.to_numeric(long_df["Nilai"], errors="coerce")
+    long_df = long_df.dropna(subset=["Nilai"])
+    long_df["Kode MK"] = long_df["Kode MK"].map(normalize_code)
+    long_df["Kode CPMK"] = long_df["Kode CPMK"].map(normalize_code)
+    long_df["Kode CPMK"] = long_df["Kode CPMK"].astype(str).str.replace(" ", "", regex=False)
+
+    lookup = prepare_mapping_lookup(mapping)
+    if not lookup.empty:
+        lookup_by_code = lookup.drop(columns=["Mata Kuliah"], errors="ignore")
+        long_df = long_df.merge(lookup_by_code, on=["Kode MK", "Kode CPMK"], how="left")
+    else:
+        long_df["Kode CPL"] = ""
+        long_df["Kode IK"] = ""
+        long_df["Notasi IK"] = ""
+
+    missing_mapping = (
+        long_df[long_df["Kode CPL"].isna() | (long_df["Kode CPL"].astype(str).str.strip() == "")]
+        [["Kode MK", "Mata Kuliah", "Kode CPMK"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    long_df["Huruf Asli"] = long_df["Nilai Huruf"]
+    long_df["Status"] = long_df["Nilai"].apply(lambda value: "Ada Nilai" if pd.notna(value) else "Kosong")
+    long_df["Komponen"] = "Nilai CPMK"
+    long_df["Bobot Komponen"] = 100
+    output_columns = [
+        "Tahun Akademik",
+        "Semester",
+        "Kode MK",
+        "Mata Kuliah",
+        "Kode CPMK",
+        "Kode CPL",
+        "Kode IK",
+        "Notasi IK",
+        "NIM",
+        "Nama Mahasiswa",
+        "Nilai",
+        "Huruf Asli",
+        "Status",
+    ]
+    return long_df[output_columns], missing_mapping
+
+
+def convert_wide_2023_2024(
+    workbook, sheet_names: Dict[str, str], mapping: Optional[pd.DataFrame]
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    nilai_rows: List[Dict[str, object]] = []
+    trace_rows: List[Dict[str, object]] = []
+    lookup = prepare_mapping_lookup(mapping)
+
+    for semester_sheet in ["GANJIL", "GENAP"]:
+        if semester_sheet not in sheet_names:
+            continue
+        raw = pd.read_excel(workbook, sheet_name=sheet_names[semester_sheet], header=None, engine="openpyxl")
+        header_row = find_wide_subheader_row(raw)
+        if header_row is None:
+            continue
+        course_row = max(header_row - 1, 0)
+        nim_col, nama_col = find_identity_columns(raw.iloc[header_row])
+        if nim_col is None or nama_col is None:
+            continue
+        course_by_col = build_wide_course_map(raw.iloc[course_row], raw.iloc[header_row])
+        data_rows = raw.iloc[header_row + 1 :].copy()
+
+        for _, row in data_rows.iterrows():
+            nim = row.iloc[nim_col] if nim_col < len(row) else ""
+            nama = row.iloc[nama_col] if nama_col < len(row) else ""
+            if pd.isna(nim) or str(nim).strip() == "":
+                continue
+            for col_index, course_name in course_by_col.items():
+                subheader = normalize_wide_subheader(raw.iat[header_row, col_index])
+                if not course_name or not subheader:
+                    continue
+                value = row.iloc[col_index]
+                if subheader in {"1", "2", "3"}:
+                    kode_cpmk = f"CPMK{subheader}"
+                    nilai_rows.append(
+                        {
+                            "Tahun Akademik": infer_year_from_workbook_name(getattr(workbook, "io", "")),
+                            "Semester": semester_sheet.title(),
+                            "Kode MK": normalize_course_code(course_name),
+                            "Mata Kuliah": str(course_name).strip(),
+                            "Kode CPMK": kode_cpmk,
+                            "NIM": str(nim).strip(),
+                            "Nama Mahasiswa": str(nama).strip(),
+                            "Nilai": value,
+                            "Huruf Asli": "",
+                            "Status": "Ada Nilai",
+                        }
+                    )
+                elif subheader in {"Rata-rata", "Nilai"}:
+                    trace_rows.append(
+                        {
+                            "Semester": semester_sheet.title(),
+                            "NIM": str(nim).strip(),
+                            "Nama Mahasiswa": str(nama).strip(),
+                            "Kode MK": normalize_course_code(course_name),
+                            "Mata Kuliah": str(course_name).strip(),
+                            "Jenis Nilai": subheader,
+                            "Nilai Asli": value,
+                        }
+                    )
+
+    nilai = pd.DataFrame(nilai_rows)
+    trace = pd.DataFrame(trace_rows)
+    if nilai.empty:
+        return nilai, trace
+    nilai["Nilai"] = pd.to_numeric(nilai["Nilai"], errors="coerce")
+    nilai = nilai.dropna(subset=["Nilai"])
+    if not lookup.empty:
+        lookup_by_code = lookup.drop(columns=["Mata Kuliah"], errors="ignore")
+        nilai = nilai.merge(lookup_by_code, on=["Kode MK", "Kode CPMK"], how="left")
+        if "Mata Kuliah" in lookup.columns:
+            missing_mask = nilai["Kode CPL"].isna() | (nilai["Kode CPL"].astype(str).str.strip() == "")
+            if missing_mask.any():
+                lookup_by_name = lookup.drop(columns=["Kode MK"], errors="ignore").copy()
+                lookup_by_name["Mata Kuliah Key"] = lookup_by_name["Mata Kuliah"].astype(str).map(normalize_label)
+                lookup_by_name = lookup_by_name.drop(columns=["Mata Kuliah"], errors="ignore").drop_duplicates(
+                    subset=["Mata Kuliah Key", "Kode CPMK"]
+                )
+                nilai["Mata Kuliah Key"] = nilai["Mata Kuliah"].astype(str).map(normalize_label)
+                name_matches = nilai.loc[missing_mask, ["Mata Kuliah Key", "Kode CPMK"]].merge(
+                    lookup_by_name, on=["Mata Kuliah Key", "Kode CPMK"], how="left"
+                )
+                for column in ["Kode CPL", "Kode IK", "Notasi IK"]:
+                    if column in name_matches.columns:
+                        nilai.loc[missing_mask, column] = name_matches[column].values
+                nilai = nilai.drop(columns=["Mata Kuliah Key"])
+    else:
+        nilai["Kode CPL"] = ""
+        nilai["Kode IK"] = ""
+        nilai["Notasi IK"] = ""
+    nilai["Komponen"] = "Nilai CPMK"
+    nilai["Bobot Komponen"] = 100
+    return nilai, trace
+
+
+def find_wide_subheader_row(raw: pd.DataFrame) -> Optional[int]:
+    for row_index in range(min(10, len(raw))):
+        values = [normalize_label(value) for value in raw.iloc[row_index].tolist()]
+        if any(value in {"nim", "no induk", "nomor induk"} for value in values) and any(
+            value in {"nama", "nama mahasiswa"} for value in values
+        ):
+            return row_index
+    return None
+
+
+def find_identity_columns(row: pd.Series) -> Tuple[Optional[int], Optional[int]]:
+    nim_col = None
+    nama_col = None
+    for index, value in enumerate(row.tolist()):
+        key = normalize_label(value)
+        if key in {"nim", "no induk", "nomor induk"}:
+            nim_col = index
+        if key in {"nama", "nama mahasiswa"}:
+            nama_col = index
+    return nim_col, nama_col
+
+
+def build_wide_course_map(course_row: pd.Series, subheader_row: pd.Series) -> Dict[int, str]:
+    course_by_col: Dict[int, str] = {}
+    current_course = ""
+    for index, value in enumerate(course_row.tolist()):
+        if not pd.isna(value) and str(value).strip():
+            current_course = str(value).strip()
+        subheader = normalize_wide_subheader(subheader_row.iloc[index] if index < len(subheader_row) else "")
+        if subheader in {"1", "2", "3", "Rata-rata", "Nilai"}:
+            course_by_col[index] = current_course
+    return course_by_col
+
+
+def normalize_wide_subheader(value: object) -> str:
+    text = str(value).strip()
+    key = normalize_label(text)
+    if key in {"1", "1.0"}:
+        return "1"
+    if key in {"2", "2.0"}:
+        return "2"
+    if key in {"3", "3.0"}:
+        return "3"
+    if key in {"rata-rata", "rata rata", "rerata"}:
+        return "Rata-rata"
+    if key in {"nilai", "nilai huruf"}:
+        return "Nilai"
+    return ""
+
+
+def normalize_course_code(course_name: object) -> str:
+    text = str(course_name).strip()
+    match = re.match(r"([A-Za-z]{2,}\\d{3,})", text)
+    return normalize_code(match.group(1) if match else text)
+
+
+def infer_year_from_workbook_name(name: object) -> str:
+    text = str(name)
+    match = re.search(r"(20\\d{2}\\s*[/\\- ]\\s*20\\d{2}|20\\d{2})", text)
+    return match.group(1).replace(" ", "") if match else ""
 
 
 def normalize_input_workbook(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -562,6 +917,18 @@ def validate_workbook(data: Dict[str, pd.DataFrame], label: str = "file") -> Lis
 def get_workbook_warnings(data: Dict[str, pd.DataFrame], label: str = "file") -> List[str]:
     warnings: List[str] = []
 
+    if "_Missing_Mapping" in data and not data["_Missing_Mapping"].empty:
+        missing = data["_Missing_Mapping"].head(20)
+        pairs = [
+            f"{row.get('Kode MK', '')} - {row.get('Kode CPMK', '')}"
+            for _, row in missing.iterrows()
+        ]
+        warnings.append(
+            "Data nilai belum termapping ke Mapping_CPMK untuk pasangan Kode MK/Kode CPMK: "
+            + ", ".join(pairs)
+            + "."
+        )
+
     for sheet, columns in REQUIRED_SHEETS.items():
         if sheet not in data:
             continue
@@ -616,6 +983,12 @@ def get_workbook_warnings(data: Dict[str, pd.DataFrame], label: str = "file") ->
             )
 
     return warnings
+
+
+def get_format_messages(data: Dict[str, pd.DataFrame]) -> List[str]:
+    if "_Format_Info" not in data or "Pesan" not in data["_Format_Info"].columns:
+        return []
+    return [str(message) for message in data["_Format_Info"]["Pesan"].dropna().tolist()]
 
 
 def validate_component_rules(mapping: pd.DataFrame, label: str) -> List[str]:
@@ -1779,6 +2152,8 @@ def render_single_mode() -> None:
             st.write(f"- {error}")
         render_guide()
         return
+    for message in get_format_messages(raw_data):
+        st.success(message)
     validation_warnings = get_workbook_warnings(raw_data)
     if validation_warnings:
         with st.expander("Catatan validasi template", expanded=False):
@@ -1919,6 +2294,7 @@ def render_multi_mode() -> None:
     period_results = []
     validation_errors: List[str] = []
     validation_warnings: List[str] = []
+    format_messages: List[str] = []
     for item in uploads:
         try:
             data = read_workbook(BytesIO(item["content"]))
@@ -1930,6 +2306,7 @@ def render_multi_mode() -> None:
             validation_errors.extend(errors)
             continue
         validation_warnings.extend(get_workbook_warnings(data, item["periode"]))
+        format_messages.extend(f"{item['periode']}: {message}" for message in get_format_messages(data))
         period_results.append(calculate_period_result(item["periode"], data))
 
     if validation_errors:
@@ -1937,6 +2314,8 @@ def render_multi_mode() -> None:
         for error in validation_errors:
             st.write(f"- {error}")
         return
+    for message in format_messages:
+        st.success(message)
     if validation_warnings:
         with st.expander("Catatan validasi template multi-semester", expanded=False):
             for warning in validation_warnings:

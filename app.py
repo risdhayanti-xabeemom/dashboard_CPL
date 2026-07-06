@@ -3419,6 +3419,22 @@ def _final_numeric_series(df: pd.DataFrame, column: str, default: float = 0.0) -
     return pd.Series(default, index=df.index, dtype="float64")
 
 
+def get_numeric_from_row(row, col, default=0.0, clamp=True):
+    if col is None or col not in row.index:
+        return default
+    value = row.get(col, default)
+    try:
+        value = pd.to_numeric(value, errors="coerce")
+        if pd.isna(value):
+            return default
+        value = float(value)
+        if clamp:
+            value = max(0.0, min(100.0, value))
+        return value
+    except Exception:
+        return default
+
+
 def _final_cpl_master(master_cpl: pd.DataFrame) -> pd.DataFrame:
     base = pd.DataFrame({"Kode CPL": CPL_RADAR_CODES})
     if master_cpl is None or master_cpl.empty:
@@ -3653,11 +3669,19 @@ def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame, rekap_cpmk: Op
     cpl_work = rekap_cpl.copy()
     cpl_work["Kode CPL"] = cpl_work["Kode CPL"].map(canonical_cpl_radar_code)
     percent_col = _final_percent_column(cpl_work)
-    actual_col = pick_existing_column(cpl_work, ["Rata-rata Nilai CPL", "Capaian CPL"])
+    actual_col = pick_existing_column(cpl_work, ["Rata-rata Nilai CPL", "Capaian CPL", "Capaian Aktual"])
+    status_col = pick_existing_column(cpl_work, ["Status"])
+    kriteria_col = pick_existing_column(cpl_work, ["Kriteria"])
     for _, cpl in cpl_work.drop_duplicates("Kode CPL").iterrows():
         kode_cpl = cpl.get("Kode CPL", "")
-        percent = safe_numeric_value(cpl, percent_col, 0.0) if percent_col else 0.0
-        actual = safe_numeric_value(cpl, actual_col, 0.0) if actual_col else 0.0
+        percent = get_numeric_from_row(cpl, percent_col, 0.0)
+        actual = get_numeric_from_row(cpl, actual_col, 0.0)
+        kriteria = cpl.get(kriteria_col, "") if kriteria_col else ""
+        status = cpl.get(status_col, "") if status_col else ""
+        if not kriteria:
+            kriteria = classify_achievement(percent)
+        if not status:
+            status = classify_cpl_status(percent)
         rule = cqi_rule(percent)
         weak_ik = weakest_items(
             rekap_ik,
@@ -3678,8 +3702,8 @@ def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame, rekap_cpmk: Op
                 "Rumusan CPL": cpl.get("Rumusan CPL", "-"),
                 "Rata-rata Nilai CPL": round(actual, 2),
                 "Persentase Ketercapaian (%)": round(percent, 2),
-                "Kriteria": cpl.get("Kriteria", classify_achievement(percent)),
-                "Status": cpl.get("Status", classify_cpl_status(percent)),
+                "Kriteria": kriteria,
+                "Status": status,
                 "Temuan": rule["Temuan"],
                 "Analisis Penyebab": "Capaian dipengaruhi oleh IK/CPMK dengan ketercapaian terendah pada CPL terkait.",
                 "Prioritas": rule["Prioritas"],
@@ -3688,7 +3712,7 @@ def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame, rekap_cpmk: Op
                 "Tindak Lanjut": "Dibahas pada rapat evaluasi kurikulum dan dimonitor pada periode berikutnya.",
                 "Capaian Aktual": round(actual, 2),
                 "Target": CPL_PERCENT_TARGET,
-                "Status Awal": cpl.get("Status", classify_cpl_status(percent)),
+                "Status Awal": status,
                 "Indikator Lemah": focus,
                 "Dugaan akar penyebab": "Perlu penelusuran pembelajaran, instrumen asesmen, dan dukungan belajar pada indikator lemah.",
                 "Rekomendasi tindak lanjut": rule["Rekomendasi"],

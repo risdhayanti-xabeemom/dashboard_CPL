@@ -2820,9 +2820,9 @@ def render_single_mode() -> None:
     with tabs[3]:
         st.dataframe(format_display(rekap_cpl), use_container_width=True, hide_index=True)
     with tabs[4]:
-        render_trend_cpl(rekap_cpl)
+        render_trend_cpl(rekap_cpmk)
     with tabs[5]:
-        render_trend_ik(trend_ik)
+        render_trend_ik(rekap_cpmk)
     next_index = 6
     if "Nilai_Asesmen_Detail" in filtered_data:
         with tabs[next_index]:
@@ -3044,9 +3044,9 @@ def render_multi_mode() -> None:
     with tabs[3]:
         st.dataframe(format_display(rekap_cpl_all), use_container_width=True, hide_index=True)
     with tabs[4]:
-        render_trend_cpl(rekap_cpl_all)
+        render_trend_cpl(rekap_cpmk_all)
     with tabs[5]:
-        render_trend_ik(trend_ik)
+        render_trend_ik(rekap_cpmk_all)
     next_index = 6
     if not detail_asesmen_all.empty:
         with tabs[next_index]:
@@ -3885,51 +3885,70 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
             )
             df = df[df["Periode"].astype(str) == selected_period].copy()
     df["Kode CPL"] = df["Kode CPL"].map(canonical_cpl_radar_code)
-    if "Persentase Ketercapaian (%)" not in df.columns:
-        percent_col = _final_percent_column(df)
-        df["Persentase Ketercapaian (%)"] = pd.to_numeric(df[percent_col], errors="coerce") if percent_col else 0
-    df["Persentase Ketercapaian (%)"] = pd.to_numeric(
-        df["Persentase Ketercapaian (%)"], errors="coerce"
-    ).fillna(0).clip(0, 100)
-    if "Rata-rata Nilai CPL" not in df.columns:
-        df["Rata-rata Nilai CPL"] = 0.0
-    df["Rata-rata Nilai CPL"] = pd.to_numeric(df["Rata-rata Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
-    df["Kriteria"] = df.get("Kriteria", df["Persentase Ketercapaian (%)"].apply(classify_achievement)).fillna(
-        df["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    value_col = pick_existing_column(
+        df,
+        [
+            "Persentase CPMK",
+            "Persentase Ketercapaian CPMK (%)",
+            "Persentase Ketercapaian (%)",
+            "Capaian CPMK",
+        ],
     )
-    df["Status"] = df.get("Status", df["Persentase Ketercapaian (%)"].apply(classify_cpl_status)).fillna(
-        df["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
-    )
-    df = df.sort_values("Kode CPL").drop_duplicates(["Kode CPL"], keep="first")
+    if value_col is None:
+        st.warning("Data Tren CPL belum memiliki kolom persentase CPMK.")
+        return
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0).clip(0, 100)
+    if "Kriteria" not in df.columns:
+        df["Kriteria"] = df[value_col].apply(classify_achievement)
+    df["Kriteria"] = df["Kriteria"].fillna(df[value_col].apply(classify_achievement))
+    cpmk_col = "Kode CPMK" if "Kode CPMK" in df.columns else None
+    if cpmk_col:
+        df = df.drop_duplicates(["Kode CPL", cpmk_col])
 
+    category_order = ["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]
     counts = df["Kriteria"].value_counts()
     cols = st.columns(5)
-    for idx, label in enumerate(["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]):
-        cols[idx].metric(f"Jumlah CPL {label}", int(counts.get(label, 0)))
+    for idx, label in enumerate(category_order):
+        cols[idx].metric(f"Jumlah CPMK {label}", int(counts.get(label, 0)))
+
+    grouped = (
+        df.groupby(["Kode CPL", "Kriteria"], dropna=False)
+        .size()
+        .reset_index(name="Jumlah CPMK")
+    )
+    totals = grouped.groupby("Kode CPL")["Jumlah CPMK"].transform("sum").replace(0, pd.NA)
+    grouped["Persentase Komposisi CPMK (%)"] = (grouped["Jumlah CPMK"] / totals * 100).fillna(0).clip(0, 100)
+    grouped["Kriteria"] = pd.Categorical(grouped["Kriteria"], categories=category_order, ordered=True)
+    grouped = grouped.sort_values(["Kode CPL", "Kriteria"])
 
     fig = px.bar(
-        df,
+        grouped,
         x="Kode CPL",
-        y="Persentase Ketercapaian (%)",
+        y="Persentase Komposisi CPMK (%)",
         color="Kriteria",
-        text=df["Persentase Ketercapaian (%)"].round(1),
+        text=grouped["Persentase Komposisi CPMK (%)"].round(1),
         color_discrete_map=ACHIEVEMENT_COLORS,
-        title="Tren CPL berdasarkan Persentase Ketercapaian",
+        category_orders={"Kriteria": category_order},
+        title="Distribusi Ketercapaian CPMK berdasarkan CPL",
     )
-    fig.update_traces(textposition="outside", cliponaxis=False)
-    fig.update_yaxes(range=[0, 105])
+    fig.update_traces(texttemplate="%{text:.1f}%", textposition="inside")
+    fig.update_layout(barmode="stack")
+    fig.update_yaxes(range=[0, 100], title="Komposisi CPMK (%)")
     st.plotly_chart(fig, width="stretch")
 
-    table_columns = [
-        "Kode CPL",
-        "Rata-rata Nilai CPL",
-        "Jumlah Mahasiswa",
-        "Jumlah Mahasiswa Mencapai",
-        "Persentase Ketercapaian (%)",
-        "Kriteria",
-        "Status",
-    ]
-    st.dataframe(format_display(df[[col for col in table_columns if col in df.columns]]), width="stretch", hide_index=True)
+    pivot = grouped.pivot_table(
+        index="Kode CPL",
+        columns="Kriteria",
+        values="Jumlah CPMK",
+        aggfunc="sum",
+        fill_value=0,
+        observed=False,
+    ).reset_index()
+    for category in category_order:
+        if category not in pivot.columns:
+            pivot[category] = 0
+    pivot["Total CPMK"] = pivot[category_order].sum(axis=1)
+    st.dataframe(format_display(pivot[["Kode CPL", "Total CPMK"] + category_order]), width="stretch", hide_index=True)
 
 
 def render_trend_ik(trend_ik: pd.DataFrame) -> None:
@@ -3951,47 +3970,66 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
     cpl_options = sorted(df["Kode CPL"].dropna().unique().tolist())
     selected_cpl = st.selectbox("Pilih Kode CPL", cpl_options, key="trend_ik_cpl_final")
     filtered = df[df["Kode CPL"] == selected_cpl].copy()
-    if "Persentase Ketercapaian (%)" not in filtered.columns:
-        percent_col = _final_percent_column(filtered)
-        filtered["Persentase Ketercapaian (%)"] = pd.to_numeric(filtered[percent_col], errors="coerce") if percent_col else 0
-    filtered["Persentase Ketercapaian (%)"] = pd.to_numeric(
-        filtered["Persentase Ketercapaian (%)"], errors="coerce"
-    ).fillna(0).clip(0, 100)
-    filtered["Kriteria"] = filtered.get(
-        "Kriteria", filtered["Persentase Ketercapaian (%)"].apply(classify_achievement)
-    ).fillna(filtered["Persentase Ketercapaian (%)"].apply(classify_achievement))
-    filtered["Status"] = filtered.get(
-        "Status", filtered["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
-    ).fillna(filtered["Persentase Ketercapaian (%)"].apply(classify_cpl_status))
+    value_col = pick_existing_column(
+        filtered,
+        [
+            "Persentase CPMK",
+            "Persentase Ketercapaian CPMK (%)",
+            "Persentase Ketercapaian (%)",
+            "Capaian CPMK",
+            "Capaian IK",
+        ],
+    )
+    if value_col is None:
+        st.warning("Data Tren IK belum memiliki kolom persentase CPMK/IK.")
+        return
+    filtered[value_col] = pd.to_numeric(filtered[value_col], errors="coerce").fillna(0).clip(0, 100)
+    if "Kriteria" not in filtered.columns:
+        filtered["Kriteria"] = filtered[value_col].apply(classify_achievement)
+    filtered["Kriteria"] = filtered["Kriteria"].fillna(filtered[value_col].apply(classify_achievement))
+    cpmk_col = "Kode CPMK" if "Kode CPMK" in filtered.columns else None
+    if cpmk_col:
+        filtered = filtered.drop_duplicates(["Kode CPL", "Kode IK", cpmk_col])
+
+    category_order = ["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]
+    grouped = (
+        filtered.groupby(["Kode IK", "Kriteria"], dropna=False)
+        .size()
+        .reset_index(name="Jumlah CPMK")
+    )
+    totals = grouped.groupby("Kode IK")["Jumlah CPMK"].transform("sum").replace(0, pd.NA)
+    grouped["Persentase Komposisi CPMK (%)"] = (grouped["Jumlah CPMK"] / totals * 100).fillna(0).clip(0, 100)
+    grouped["Kriteria"] = pd.Categorical(grouped["Kriteria"], categories=category_order, ordered=True)
+    grouped = grouped.sort_values(["Kode IK", "Kriteria"])
 
     fig = px.bar(
-        filtered.sort_values("Kode IK"),
+        grouped,
         x="Kode IK",
-        y="Persentase Ketercapaian (%)",
+        y="Persentase Komposisi CPMK (%)",
         color="Kriteria",
-        text=filtered.sort_values("Kode IK")["Persentase Ketercapaian (%)"].round(1),
+        text=grouped["Persentase Komposisi CPMK (%)"].round(1),
         color_discrete_map=ACHIEVEMENT_COLORS,
-        title=f"Tren IK pada {selected_cpl}",
+        category_orders={"Kriteria": category_order},
+        title=f"Distribusi Ketercapaian CPMK berdasarkan IK pada {selected_cpl}",
     )
-    fig.update_traces(textposition="outside", cliponaxis=False)
-    fig.update_yaxes(range=[0, 105])
+    fig.update_traces(texttemplate="%{text:.1f}%", textposition="inside")
+    fig.update_layout(barmode="stack")
+    fig.update_yaxes(range=[0, 100], title="Komposisi CPMK (%)")
     st.plotly_chart(fig, width="stretch")
 
-    table_columns = [
-        "Kode IK",
-        "Rumusan IK",
-        "Capaian IK",
-        "Jumlah Mahasiswa",
-        "Jumlah Mahasiswa Mencapai",
-        "Persentase Ketercapaian (%)",
-        "Kriteria",
-        "Status",
-    ]
-    st.dataframe(
-        format_display(filtered[[col for col in table_columns if col in filtered.columns]].sort_values("Kode IK")),
-        width="stretch",
-        hide_index=True,
-    )
+    pivot = grouped.pivot_table(
+        index="Kode IK",
+        columns="Kriteria",
+        values="Jumlah CPMK",
+        aggfunc="sum",
+        fill_value=0,
+        observed=False,
+    ).reset_index()
+    for category in category_order:
+        if category not in pivot.columns:
+            pivot[category] = 0
+    pivot["Total CPMK"] = pivot[category_order].sum(axis=1)
+    st.dataframe(format_display(pivot[["Kode IK", "Total CPMK"] + category_order]), width="stretch", hide_index=True)
 
 
 def render_student_cpl_radar(

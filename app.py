@@ -982,6 +982,11 @@ def get_workbook_warnings(data: Dict[str, pd.DataFrame], label: str = "file") ->
                 f"{label}: Target belum memuat parameter 'Target Pemenuhan CPL (%)' atau 'Target Ketercapaian CPL'."
             )
 
+    if has_out_of_range_input_values(data):
+        warnings.append(
+            f"{label}: Beberapa nilai input berada di luar rentang 0–100 dan telah dinormalisasi untuk perhitungan."
+        )
+
     return warnings
 
 
@@ -1048,6 +1053,56 @@ def validate_component_weights(mapping: pd.DataFrame, label: str) -> List[str]:
     return warnings
 
 
+def clamp_score(series_or_value):
+    converted = pd.to_numeric(series_or_value, errors="coerce")
+    if isinstance(converted, (pd.Series, pd.Index)):
+        return converted.clip(lower=0, upper=100)
+    if pd.isna(converted):
+        return converted
+    return max(0, min(100, float(converted)))
+
+
+def clean_weight_series(series_or_value):
+    weights = pd.to_numeric(series_or_value, errors="coerce")
+    if not isinstance(weights, pd.Series):
+        if pd.isna(weights) or weights <= 0:
+            return 1.0
+        return float(weights / 100 if weights > 1 else weights)
+    weights = weights.where(weights > 0, 1).fillna(1)
+    return weights.where(weights <= 1, weights / 100)
+
+
+def weighted_mean_0_100(df, value_col="Nilai_Bersih", weight_col="Bobot_CPMK_Bersih"):
+    values = pd.to_numeric(df[value_col], errors="coerce").clip(lower=0, upper=100)
+    weights = pd.to_numeric(df[weight_col], errors="coerce")
+    weights = weights.where(weights > 0, 1).fillna(1)
+    if weights.sum() <= 0:
+        result = values.mean()
+    else:
+        result = (values * weights).sum() / weights.sum()
+    if pd.isna(result):
+        result = 0
+    return max(0, min(100, result))
+
+
+def clamp_rekap_scores(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    output = df.copy()
+    for column in columns:
+        if column in output.columns:
+            output[column] = clamp_score(output[column]).fillna(0)
+    return output
+
+
+def has_out_of_range_input_values(data: Dict[str, pd.DataFrame]) -> bool:
+    for sheet in ["Nilai_CPMK", "Nilai_Asesmen_Detail"]:
+        if sheet not in data or "Nilai" not in data[sheet].columns:
+            continue
+        values = pd.to_numeric(data[sheet]["Nilai"], errors="coerce").dropna()
+        if ((values < 0) | (values > 100)).any():
+            return True
+    return False
+
+
 def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     prepared = {sheet: df.copy() for sheet, df in data.items()}
     code_columns = {
@@ -1067,14 +1122,23 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     prepared["Mapping_CPMK"]["Bobot CPMK"] = pd.to_numeric(
         prepared["Mapping_CPMK"]["Bobot CPMK"], errors="coerce"
     )
+    prepared["Mapping_CPMK"]["Bobot_CPMK_Bersih"] = clean_weight_series(
+        prepared["Mapping_CPMK"]["Bobot CPMK"]
+    )
     prepared["Mapping_CPMK"]["Bobot Komponen"] = pd.to_numeric(
         prepared["Mapping_CPMK"]["Bobot Komponen"], errors="coerce"
     )
     prepared["Nilai_CPMK"]["Nilai"] = pd.to_numeric(prepared["Nilai_CPMK"]["Nilai"], errors="coerce")
+    prepared["Nilai_CPMK"]["Nilai_Bersih"] = clamp_score(prepared["Nilai_CPMK"]["Nilai"])
+    prepared["Nilai_CPMK"]["Nilai"] = prepared["Nilai_CPMK"]["Nilai_Bersih"]
     if "Nilai_Asesmen_Detail" in prepared:
         prepared["Nilai_Asesmen_Detail"]["Nilai"] = pd.to_numeric(
             prepared["Nilai_Asesmen_Detail"]["Nilai"], errors="coerce"
         )
+        prepared["Nilai_Asesmen_Detail"]["Nilai_Bersih"] = clamp_score(
+            prepared["Nilai_Asesmen_Detail"]["Nilai"]
+        )
+        prepared["Nilai_Asesmen_Detail"]["Nilai"] = prepared["Nilai_Asesmen_Detail"]["Nilai_Bersih"]
         prepared["Nilai_Asesmen_Detail"]["Bobot Komponen"] = pd.to_numeric(
             prepared["Nilai_Asesmen_Detail"]["Bobot Komponen"], errors="coerce"
         )
@@ -1142,8 +1206,9 @@ def add_period_columns(df: pd.DataFrame, periode: str, tahun_akademik: str, seme
 def calculate_rekap_cpmk(
     mapping: pd.DataFrame, nilai: pd.DataFrame, batas_nilai_minimum: float
 ) -> pd.DataFrame:
-    nilai_valid = nilai.dropna(subset=["Kode CPMK", "Nilai"]).copy()
-    nilai_valid["Tercapai"] = nilai_valid["Nilai"] >= batas_nilai_minimum
+    nilai_valid = nilai.dropna(subset=["Kode CPMK", "Nilai_Bersih"]).copy()
+    nilai_valid["Nilai_Bersih"] = clamp_score(nilai_valid["Nilai_Bersih"])
+    nilai_valid["Tercapai"] = nilai_valid["Nilai_Bersih"] >= batas_nilai_minimum
     group_keys = [
         column
         for column in ["Tahun Akademik", "Semester", "Kode MK", "Mata Kuliah", "Kode CPMK", "Kode CPL", "Kode IK"]
@@ -1157,13 +1222,14 @@ def calculate_rekap_cpmk(
             **{
                 "Jumlah Mahasiswa": ("NIM", "nunique"),
                 "Jumlah Mahasiswa Tercapai": ("Tercapai", "sum"),
-                "Rata-rata Nilai": ("Nilai", "mean"),
+                "Rata-rata Nilai": ("Nilai_Bersih", "mean"),
             }
         )
     )
     grouped["Persentase CPMK"] = (
         grouped["Jumlah Mahasiswa Tercapai"] / grouped["Jumlah Mahasiswa"] * 100
-    ).fillna(0)
+    ).fillna(0).clip(lower=0, upper=100)
+    grouped["Capaian CPMK"] = clamp_score(grouped["Rata-rata Nilai"]).fillna(0)
 
     mapping_columns = [
         "Tahun Akademik",
@@ -1175,6 +1241,7 @@ def calculate_rekap_cpmk(
         "Kode CPL",
         "Kode IK",
         "Bobot CPMK",
+        "Bobot_CPMK_Bersih",
     ]
     mapping_unique_key = [
         "Tahun Akademik",
@@ -1184,7 +1251,10 @@ def calculate_rekap_cpmk(
         "Kode CPL",
         "Kode IK",
     ]
-    mapping_unique = mapping[mapping_columns].drop_duplicates(subset=mapping_unique_key)
+    available_mapping_columns = [column for column in mapping_columns if column in mapping.columns]
+    mapping_unique = mapping[available_mapping_columns].drop_duplicates(subset=mapping_unique_key)
+    if "Bobot_CPMK_Bersih" not in mapping_unique.columns:
+        mapping_unique["Bobot_CPMK_Bersih"] = clean_weight_series(mapping_unique.get("Bobot CPMK", 1))
 
     merge_keys = [key for key in mapping_unique_key if key in grouped.columns]
     if not merge_keys:
@@ -1200,36 +1270,50 @@ def calculate_rekap_cpmk(
         "Jumlah Mahasiswa Tercapai",
         "Rata-rata Nilai",
         "Persentase CPMK",
+        "Capaian CPMK",
     ]
     rekap[fill_zero_columns] = rekap[fill_zero_columns].fillna(0)
+    rekap = clamp_rekap_scores(rekap, ["Rata-rata Nilai", "Persentase CPMK", "Capaian CPMK"])
     return rekap.sort_values(["Kode CPL", "Kode IK", "Kode MK", "Kode CPMK"]).reset_index(drop=True)
 
 
 def weighted_average(group: pd.DataFrame) -> float:
-    weights = pd.to_numeric(group["Bobot CPMK"], errors="coerce")
-    values = pd.to_numeric(group["Persentase CPMK"], errors="coerce").fillna(0)
-    if weights.notna().any() and weights.fillna(0).sum() > 0:
-        return float((values * weights.fillna(0)).sum() / weights.fillna(0).sum())
-    return float(values.mean()) if len(values) else 0.0
+    value_col = "Capaian CPMK" if "Capaian CPMK" in group.columns else "Persentase CPMK"
+    weight_col = "Bobot_CPMK_Bersih" if "Bobot_CPMK_Bersih" in group.columns else "Bobot CPMK"
+    working = group.copy()
+    if weight_col == "Bobot CPMK":
+        working["Bobot_CPMK_Bersih"] = clean_weight_series(working["Bobot CPMK"])
+        weight_col = "Bobot_CPMK_Bersih"
+    return float(weighted_mean_0_100(working, value_col, weight_col))
 
 
 def calculate_rekap_ik(
     rekap_cpmk: pd.DataFrame, master_ik: pd.DataFrame, target_ketercapaian: float
 ) -> pd.DataFrame:
-    ik_values = pd.DataFrame(
-        [
-            {"Kode IK": kode_ik, "Capaian IK": weighted_average(group)}
-            for kode_ik, group in rekap_cpmk.groupby("Kode IK")
-        ],
-        columns=["Kode IK", "Capaian IK"],
-    )
+    group_keys = [column for column in ["Kode CPL", "Kode IK"] if column in rekap_cpmk.columns]
+    ik_rows = []
+    for keys, group in rekap_cpmk.groupby(group_keys, dropna=False):
+        key_tuple = keys if isinstance(keys, tuple) else (keys,)
+        row = dict(zip(group_keys, key_tuple))
+        row["Capaian IK"] = weighted_average(group)
+        row["Total Bobot CPMK"] = pd.to_numeric(
+            group.get("Bobot_CPMK_Bersih", pd.Series([1] * len(group), index=group.index)),
+            errors="coerce",
+        ).where(lambda weights: weights > 0, 1).fillna(1).sum()
+        ik_rows.append(row)
+    ik_values = pd.DataFrame(ik_rows, columns=group_keys + ["Capaian IK", "Total Bobot CPMK"])
     counts = (
-        rekap_cpmk.groupby("Kode IK", as_index=False)
+        rekap_cpmk.groupby(group_keys, as_index=False, dropna=False)
         .agg(**{"Jumlah CPMK Pendukung": ("Kode CPMK", "nunique")})
     )
-    rekap = master_ik.merge(ik_values, on="Kode IK", how="left").merge(counts, on="Kode IK", how="left")
+    merge_keys = [key for key in group_keys if key in master_ik.columns]
+    if not merge_keys:
+        merge_keys = ["Kode IK"]
+    rekap = master_ik.merge(ik_values, on=merge_keys, how="left").merge(counts, on=merge_keys, how="left")
     rekap["Capaian IK"] = rekap["Capaian IK"].fillna(0)
+    rekap["Capaian IK"] = clamp_score(rekap["Capaian IK"]).fillna(0)
     rekap["Jumlah CPMK Pendukung"] = rekap["Jumlah CPMK Pendukung"].fillna(0).astype(int)
+    rekap["Total Bobot CPMK"] = rekap["Total Bobot CPMK"].fillna(0)
     rekap["Target"] = target_ketercapaian
     rekap["Status"] = rekap["Capaian IK"].apply(lambda value: status_by_target(value, target_ketercapaian))
     return rekap.sort_values(["Kode CPL", "Kode IK"]).reset_index(drop=True)
@@ -1238,12 +1322,22 @@ def calculate_rekap_ik(
 def calculate_rekap_cpl(
     rekap_ik: pd.DataFrame, master_cpl: pd.DataFrame, target_ketercapaian: float
 ) -> pd.DataFrame:
-    cpl_values = (
-        rekap_ik.groupby("Kode CPL", as_index=False)
-        .agg(**{"Capaian CPL": ("Capaian IK", "mean"), "Jumlah IK Pendukung": ("Kode IK", "nunique")})
-    )
+    cpl_rows = []
+    for kode_cpl, group in rekap_ik.groupby("Kode CPL", dropna=False):
+        working = group.copy()
+        if "Total Bobot CPMK" not in working.columns or pd.to_numeric(working["Total Bobot CPMK"], errors="coerce").fillna(0).sum() <= 0:
+            working["Total Bobot CPMK"] = 1
+        cpl_rows.append(
+            {
+                "Kode CPL": kode_cpl,
+                "Capaian CPL": weighted_mean_0_100(working, "Capaian IK", "Total Bobot CPMK"),
+                "Jumlah IK Pendukung": working["Kode IK"].nunique(),
+            }
+        )
+    cpl_values = pd.DataFrame(cpl_rows, columns=["Kode CPL", "Capaian CPL", "Jumlah IK Pendukung"])
     rekap = master_cpl.merge(cpl_values, on="Kode CPL", how="left")
     rekap["Capaian CPL"] = rekap["Capaian CPL"].fillna(0)
+    rekap["Capaian CPL"] = clamp_score(rekap["Capaian CPL"]).fillna(0)
     rekap["Jumlah IK Pendukung"] = rekap["Jumlah IK Pendukung"].fillna(0).astype(int)
     rekap["Target"] = target_ketercapaian
     rekap["Status"] = rekap["Capaian CPL"].apply(lambda value: status_by_target(value, target_ketercapaian))
@@ -1319,19 +1413,21 @@ def calculate_all(
 ) -> Dict[str, pd.DataFrame | float]:
     prepared = prepare_data(data)
     batas = (
-        float(batas_nilai)
+        float(clamp_score(batas_nilai))
         if batas_nilai is not None
         else get_target_value(
             prepared["Target"], "Batas Nilai Minimum IK", 70, ["Batas Nilai Minimum"]
         )
     )
     target = (
-        float(target_cpl)
+        float(clamp_score(target_cpl))
         if target_cpl is not None
         else get_target_value(
             prepared["Target"], "Target Pemenuhan CPL (%)", 70, ["Target Ketercapaian CPL"]
         )
     )
+    batas = float(clamp_score(batas))
+    target = float(clamp_score(target))
     rekap_cpmk = calculate_rekap_cpmk(prepared["Mapping_CPMK"], prepared["Nilai_CPMK"], batas)
     rekap_ik = calculate_rekap_ik(rekap_cpmk, prepared["Master_IK"], target)
     rekap_cpl = calculate_rekap_cpl(rekap_ik, prepared["Master_CPL"], target)
@@ -1371,28 +1467,29 @@ def prepare_student_cpl_source(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         if column in nilai.columns:
             nilai[column] = nilai[column].map(normalize_code)
 
-    if "Bobot CPMK" not in nilai.columns:
-        nilai["Bobot CPMK"] = pd.NA
+    if "Bobot_CPMK_Bersih" not in nilai.columns:
+        nilai["Bobot_CPMK_Bersih"] = pd.NA
 
-    nilai["Bobot CPMK"] = pd.to_numeric(nilai["Bobot CPMK"], errors="coerce")
-
-    if {"Kode MK", "Kode CPMK", "Bobot CPMK"}.issubset(mapping.columns):
-        mapping_weight = mapping[["Kode MK", "Kode CPMK", "Bobot CPMK"]].copy()
+    if {"Kode MK", "Kode CPMK", "Bobot_CPMK_Bersih"}.issubset(mapping.columns):
+        mapping_weight = mapping[["Kode MK", "Kode CPMK", "Bobot_CPMK_Bersih"]].copy()
         mapping_weight["Kode MK"] = mapping_weight["Kode MK"].map(normalize_code)
         mapping_weight["Kode CPMK"] = mapping_weight["Kode CPMK"].map(normalize_code)
-        mapping_weight["Bobot CPMK"] = pd.to_numeric(mapping_weight["Bobot CPMK"], errors="coerce")
+        mapping_weight["Bobot_CPMK_Bersih"] = pd.to_numeric(mapping_weight["Bobot_CPMK_Bersih"], errors="coerce")
         mapping_weight = (
-            mapping_weight.dropna(subset=["Bobot CPMK"])
+            mapping_weight.dropna(subset=["Bobot_CPMK_Bersih"])
             .drop_duplicates(subset=["Kode MK", "Kode CPMK"])
-            .rename(columns={"Bobot CPMK": "Bobot CPMK Mapping"})
+            .rename(columns={"Bobot_CPMK_Bersih": "Bobot CPMK Mapping"})
         )
         nilai = nilai.merge(mapping_weight, on=["Kode MK", "Kode CPMK"], how="left")
-        nilai["Bobot CPMK"] = nilai["Bobot CPMK"].fillna(nilai["Bobot CPMK Mapping"])
+        nilai["Bobot_CPMK_Bersih"] = nilai["Bobot_CPMK_Bersih"].fillna(nilai["Bobot CPMK Mapping"])
         nilai = nilai.drop(columns=["Bobot CPMK Mapping"], errors="ignore")
 
-    nilai["Bobot CPMK"] = nilai["Bobot CPMK"].where(nilai["Bobot CPMK"] > 0, 1).fillna(1)
-    nilai["Nilai"] = pd.to_numeric(nilai["Nilai"], errors="coerce")
-    nilai = nilai.dropna(subset=["NIM", "Kode CPL", "Nilai"])
+    nilai["Bobot_CPMK_Bersih"] = pd.to_numeric(nilai["Bobot_CPMK_Bersih"], errors="coerce")
+    nilai["Bobot_CPMK_Bersih"] = nilai["Bobot_CPMK_Bersih"].where(nilai["Bobot_CPMK_Bersih"] > 0, 1).fillna(1)
+    if "Nilai_Bersih" not in nilai.columns:
+        nilai["Nilai_Bersih"] = clamp_score(nilai["Nilai"])
+    nilai["Nilai_Bersih"] = clamp_score(nilai["Nilai_Bersih"])
+    nilai = nilai.dropna(subset=["NIM", "Kode CPL", "Nilai_Bersih"])
     nilai = nilai[nilai["NIM"].astype(str).str.strip() != ""]
     nilai["Kode CPL Radar"] = nilai["Kode CPL"].map(canonical_cpl_radar_code)
     nilai = nilai[nilai["Kode CPL Radar"].isin(CPL_RADAR_CODES)]
@@ -1414,10 +1511,7 @@ def calculate_student_cpl_table(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     for keys, group in grouped:
         keys_tuple = keys if isinstance(keys, tuple) else (keys,)
         row = dict(zip(identity_columns + ["Kode CPL Radar"], keys_tuple))
-        weights = pd.to_numeric(group["Bobot CPMK"], errors="coerce").fillna(1)
-        values = pd.to_numeric(group["Nilai"], errors="coerce").fillna(0)
-        total_weight = weights.sum()
-        row["Nilai CPL"] = float((values * weights).sum() / total_weight) if total_weight > 0 else 0.0
+        row["Nilai CPL"] = float(weighted_mean_0_100(group, "Nilai_Bersih", "Bobot_CPMK_Bersih"))
         row["Jumlah CPMK"] = int(group["Kode CPMK"].nunique()) if "Kode CPMK" in group.columns else len(group)
         rows.append(row)
 
@@ -1961,6 +2055,7 @@ def ensure_example_workbooks() -> None:
 def format_display(df: pd.DataFrame) -> pd.DataFrame:
     display = df.copy()
     numeric_columns = [
+        "Capaian CPMK",
         "Persentase CPMK",
         "Capaian IK",
         "Capaian CPL",
@@ -1971,10 +2066,29 @@ def format_display(df: pd.DataFrame) -> pd.DataFrame:
         "Target",
         "Perubahan",
         "Rata-rata Nilai",
+        "Nilai CPL",
+        "Nilai_Bersih",
     ]
+    score_columns = {
+        "Capaian CPMK",
+        "Persentase CPMK",
+        "Capaian IK",
+        "Capaian CPL",
+        "Capaian Aktual",
+        "Capaian Awal",
+        "Capaian Berikut",
+        "Capaian Semester Berikutnya",
+        "Target",
+        "Rata-rata Nilai",
+        "Nilai CPL",
+        "Nilai_Bersih",
+    }
     for column in numeric_columns:
         if column in display.columns:
-            display[column] = pd.to_numeric(display[column], errors="coerce").round(2)
+            values = pd.to_numeric(display[column], errors="coerce")
+            if column in score_columns:
+                values = values.clip(lower=0, upper=100)
+            display[column] = values.round(2)
     return display
 
 

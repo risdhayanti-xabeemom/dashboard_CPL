@@ -1347,10 +1347,224 @@ def calculate_all(
     }
 
 
-def calculate_period_result(period_label: str, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+CPL_RADAR_CODES = [f"CPL{index:02d}" for index in range(1, 11)]
+STUDENT_CPL_TARGET = 50.0
+
+
+def canonical_cpl_radar_code(value: object) -> str:
+    text = normalize_code(value)
+    match = re.search(r"CPL\s*0*(\d+)", text)
+    if not match:
+        return text
+    return f"CPL{int(match.group(1)):02d}"
+
+
+def prepare_student_cpl_source(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    prepared = prepare_data(data)
+    nilai = prepared["Nilai_CPMK"].copy()
+    mapping = prepared["Mapping_CPMK"].copy()
+
+    if nilai.empty:
+        return pd.DataFrame()
+
+    for column in ["Kode MK", "Kode CPMK", "Kode CPL", "NIM"]:
+        if column in nilai.columns:
+            nilai[column] = nilai[column].map(normalize_code)
+
+    if "Bobot CPMK" not in nilai.columns:
+        nilai["Bobot CPMK"] = pd.NA
+
+    nilai["Bobot CPMK"] = pd.to_numeric(nilai["Bobot CPMK"], errors="coerce")
+
+    if {"Kode MK", "Kode CPMK", "Bobot CPMK"}.issubset(mapping.columns):
+        mapping_weight = mapping[["Kode MK", "Kode CPMK", "Bobot CPMK"]].copy()
+        mapping_weight["Kode MK"] = mapping_weight["Kode MK"].map(normalize_code)
+        mapping_weight["Kode CPMK"] = mapping_weight["Kode CPMK"].map(normalize_code)
+        mapping_weight["Bobot CPMK"] = pd.to_numeric(mapping_weight["Bobot CPMK"], errors="coerce")
+        mapping_weight = (
+            mapping_weight.dropna(subset=["Bobot CPMK"])
+            .drop_duplicates(subset=["Kode MK", "Kode CPMK"])
+            .rename(columns={"Bobot CPMK": "Bobot CPMK Mapping"})
+        )
+        nilai = nilai.merge(mapping_weight, on=["Kode MK", "Kode CPMK"], how="left")
+        nilai["Bobot CPMK"] = nilai["Bobot CPMK"].fillna(nilai["Bobot CPMK Mapping"])
+        nilai = nilai.drop(columns=["Bobot CPMK Mapping"], errors="ignore")
+
+    nilai["Bobot CPMK"] = nilai["Bobot CPMK"].where(nilai["Bobot CPMK"] > 0, 1).fillna(1)
+    nilai["Nilai"] = pd.to_numeric(nilai["Nilai"], errors="coerce")
+    nilai = nilai.dropna(subset=["NIM", "Kode CPL", "Nilai"])
+    nilai = nilai[nilai["NIM"].astype(str).str.strip() != ""]
+    nilai["Kode CPL Radar"] = nilai["Kode CPL"].map(canonical_cpl_radar_code)
+    nilai = nilai[nilai["Kode CPL Radar"].isin(CPL_RADAR_CODES)]
+    return nilai
+
+
+def calculate_student_cpl_table(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    source = prepare_student_cpl_source(data)
+    if source.empty:
+        return pd.DataFrame()
+
+    identity_columns = [
+        column
+        for column in ["Periode", "Kelas", "NIM", "Nama Mahasiswa"]
+        if column in source.columns
+    ]
+    grouped = source.groupby(identity_columns + ["Kode CPL Radar"], dropna=False)
+    rows = []
+    for keys, group in grouped:
+        keys_tuple = keys if isinstance(keys, tuple) else (keys,)
+        row = dict(zip(identity_columns + ["Kode CPL Radar"], keys_tuple))
+        weights = pd.to_numeric(group["Bobot CPMK"], errors="coerce").fillna(1)
+        values = pd.to_numeric(group["Nilai"], errors="coerce").fillna(0)
+        total_weight = weights.sum()
+        row["Nilai CPL"] = float((values * weights).sum() / total_weight) if total_weight > 0 else 0.0
+        row["Jumlah CPMK"] = int(group["Kode CPMK"].nunique()) if "Kode CPMK" in group.columns else len(group)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_student_cpl_detail(
+    student_rows: pd.DataFrame, master_cpl: pd.DataFrame
+) -> pd.DataFrame:
+    rumusan_lookup = pd.DataFrame({"Kode CPL Radar": CPL_RADAR_CODES})
+    if {"Kode CPL", "Rumusan CPL"}.issubset(master_cpl.columns):
+        master = master_cpl[["Kode CPL", "Rumusan CPL"]].copy()
+        master["Kode CPL Radar"] = master["Kode CPL"].map(canonical_cpl_radar_code)
+        rumusan_lookup = rumusan_lookup.merge(
+            master[["Kode CPL Radar", "Rumusan CPL"]].drop_duplicates("Kode CPL Radar"),
+            on="Kode CPL Radar",
+            how="left",
+        )
+
+    values = student_rows[["Kode CPL Radar", "Nilai CPL"]].copy()
+    detail = rumusan_lookup.merge(values, on="Kode CPL Radar", how="left")
+    detail["Has Data"] = detail["Nilai CPL"].notna()
+    detail["Nilai CPL"] = detail["Nilai CPL"].fillna(0).clip(0, 100)
+    detail["Status"] = detail.apply(
+        lambda row: "Belum ada data"
+        if not row["Has Data"]
+        else ("Tercapai" if row["Nilai CPL"] >= STUDENT_CPL_TARGET else "Belum Tercapai"),
+        axis=1,
+    )
+    detail["Kode CPL"] = detail["Kode CPL Radar"]
+    detail["Rumusan CPL"] = detail["Rumusan CPL"].fillna("-")
+    return detail[["Kode CPL", "Rumusan CPL", "Nilai CPL", "Status", "Has Data"]]
+
+
+def render_student_cpl_radar(
+    data: Dict[str, pd.DataFrame],
+    key_prefix: str,
+    show_period_filter: bool = False,
+) -> None:
+    student_cpl = calculate_student_cpl_table(data)
+    if student_cpl.empty:
+        st.info("Belum ada data nilai mahasiswa yang dapat ditampilkan sebagai Radar CPL.")
+        return
+
+    filtered = student_cpl.copy()
+    filter_cols = st.columns(3 if show_period_filter else 2)
+    col_index = 0
+    selected_period = None
+    if show_period_filter and "Periode" in filtered.columns:
+        period_options = sorted(filtered["Periode"].dropna().astype(str).unique().tolist())
+        selected_period = filter_cols[col_index].selectbox(
+            "Periode", period_options, key=f"{key_prefix}_periode"
+        )
+        filtered = filtered[filtered["Periode"].astype(str) == selected_period]
+        col_index += 1
+
+    selected_kelas = None
+    if "Kelas" in filtered.columns:
+        kelas_options = ["Semua Kelas"] + sorted(filtered["Kelas"].dropna().astype(str).unique().tolist())
+        selected_kelas = filter_cols[col_index].selectbox("Kelas", kelas_options, key=f"{key_prefix}_kelas")
+        if selected_kelas != "Semua Kelas":
+            filtered = filtered[filtered["Kelas"].astype(str) == selected_kelas]
+        col_index += 1
+
+    student_options = (
+        filtered[["NIM", "Nama Mahasiswa"]]
+        .drop_duplicates()
+        .sort_values(["Nama Mahasiswa", "NIM"])
+        .reset_index(drop=True)
+    )
+    if student_options.empty:
+        st.info("Tidak ada mahasiswa pada filter yang dipilih.")
+        return
+
+    student_options["Label"] = student_options.apply(
+        lambda row: f"{row['NIM']} - {row.get('Nama Mahasiswa', '')}", axis=1
+    )
+    select_column = filter_cols[min(col_index, len(filter_cols) - 1)]
+    selected_label = select_column.selectbox(
+        "NIM/Nama Mahasiswa", student_options["Label"].tolist(), key=f"{key_prefix}_mahasiswa"
+    )
+    selected_student = student_options[student_options["Label"] == selected_label].iloc[0]
+    student_rows = filtered[filtered["NIM"].astype(str) == str(selected_student["NIM"])]
+    detail = build_student_cpl_detail(student_rows, data["Master_CPL"])
+
+    identity = student_rows.iloc[0]
+    meta_parts = [
+        f"NIM: {identity.get('NIM', '-')}",
+        f"Nama: {identity.get('Nama Mahasiswa', '-')}",
+    ]
+    if "Kelas" in student_rows.columns:
+        meta_parts.append(f"Kelas: {identity.get('Kelas', '-')}")
+    if "Periode" in student_rows.columns:
+        meta_parts.append(f"Periode: {identity.get('Periode', selected_period or '-')}")
+    st.markdown("**Identitas Mahasiswa:** " + " | ".join(str(part) for part in meta_parts))
+
+    available = detail[detail["Has Data"]]
+    average_value = float(available["Nilai CPL"].mean()) if not available.empty else 0.0
+    highest = available.sort_values("Nilai CPL", ascending=False).iloc[0] if not available.empty else None
+    lowest = available.sort_values("Nilai CPL", ascending=True).iloc[0] if not available.empty else None
+    achieved = int((available["Nilai CPL"] >= STUDENT_CPL_TARGET).sum())
+    not_achieved = int((available["Nilai CPL"] < STUDENT_CPL_TARGET).sum())
+
+    summary_cols = st.columns(5)
+    summary_cols[0].metric("Rata-rata CPL", f"{average_value:.2f}")
+    summary_cols[1].metric("CPL Tertinggi", "-" if highest is None else f"{highest['Kode CPL']} ({highest['Nilai CPL']:.1f})")
+    summary_cols[2].metric("CPL Terendah", "-" if lowest is None else f"{lowest['Kode CPL']} ({lowest['Nilai CPL']:.1f})")
+    summary_cols[3].metric("CPL Tercapai", achieved)
+    summary_cols[4].metric("CPL Belum Tercapai", not_achieved)
+
+    theta = detail["Kode CPL"].tolist()
+    values = detail["Nilai CPL"].round(2).tolist()
+    radar = go.Figure()
+    radar.add_trace(
+        go.Scatterpolar(
+            r=values + [values[0]],
+            theta=theta + [theta[0]],
+            fill="toself",
+            name="Nilai CPL Mahasiswa",
+            line_color="#2563eb",
+        )
+    )
+    radar.add_trace(
+        go.Scatterpolar(
+            r=[STUDENT_CPL_TARGET] * (len(theta) + 1),
+            theta=theta + [theta[0]],
+            mode="lines",
+            name="Target Minimum 50",
+            line=dict(color="#ef4444", dash="dash"),
+        )
+    )
+    radar.update_layout(
+        title="Radar CPL Per Mahasiswa",
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        showlegend=True,
+    )
+    st.plotly_chart(radar, use_container_width=True)
+
+    display_detail = detail.drop(columns=["Has Data"]).copy()
+    display_detail["Nilai CPL"] = display_detail["Nilai CPL"].round(2)
+    st.dataframe(format_display(display_detail), use_container_width=True, hide_index=True)
+
+
+def calculate_period_result(period_label: str, data: Dict[str, pd.DataFrame]) -> Dict[str, object]:
     tahun_akademik, semester = parse_period_label(period_label)
     result = calculate_all(data)
-    output: Dict[str, pd.DataFrame] = {}
+    output: Dict[str, object] = {}
     for key in ["rekap_cpmk", "rekap_ik", "rekap_cpl", "cqi"]:
         output[key] = add_period_columns(
             result[key], period_label, tahun_akademik, semester  # type: ignore[arg-type]
@@ -1360,6 +1574,13 @@ def calculate_period_result(period_label: str, data: Dict[str, pd.DataFrame]) ->
         output["detail_asesmen"] = add_period_columns(
             prepared["Nilai_Asesmen_Detail"], period_label, tahun_akademik, semester
         )
+    if isinstance(prepared, dict):
+        output["student_data"] = {
+            "Master_CPL": prepared["Master_CPL"].copy(),
+            "Mapping_CPMK": add_period_columns(prepared["Mapping_CPMK"], period_label, tahun_akademik, semester),
+            "Nilai_CPMK": add_period_columns(prepared["Nilai_CPMK"], period_label, tahun_akademik, semester),
+            "Target": prepared["Target"].copy(),
+        }
     output["target_cpl"] = result["target_cpl"]  # type: ignore[assignment]
     return output
 
@@ -2242,7 +2463,16 @@ def render_single_mode() -> None:
     tab_names.extend(["CQI", "Evaluasi CQI", "Panduan Input Data"])
     tabs = st.tabs(tab_names)
     with tabs[0]:
-        render_dashboard(rekap_cpl, rekap_ik)
+        analysis_view = st.radio(
+            "Pilihan Analisis",
+            ["Ringkasan CPL", "Radar CPL Per Mahasiswa"],
+            horizontal=True,
+            key="single_dashboard_analysis_view",
+        )
+        if analysis_view == "Ringkasan CPL":
+            render_dashboard(rekap_cpl, rekap_ik)
+        else:
+            render_student_cpl_radar(result["prepared"], "single_student_cpl")
     with tabs[1]:
         st.dataframe(format_display(rekap_cpmk), use_container_width=True, hide_index=True)
     with tabs[2]:
@@ -2318,25 +2548,64 @@ def render_multi_mode() -> None:
     validation_errors: List[str] = []
     validation_warnings: List[str] = []
     format_messages: List[str] = []
+    period_labels: List[str] = []
+    nilai_frames: List[pd.DataFrame] = []
+    base_data: Optional[Dict[str, pd.DataFrame]] = None
+
     for item in uploads:
+        periode = item["periode"]
         try:
-            data = read_workbook(BytesIO(item["content"]))
+            uploaded_file = BytesIO(item["content"])
+            uploaded_file.seek(0)
+            period_data = read_workbook(uploaded_file)
+
+            master_cpl = period_data["Master_CPL"].copy()
+            master_ik = period_data["Master_IK"].copy()
+            mapping_cpmk = period_data["Mapping_CPMK"].copy()
+            nilai_cpmk = period_data["Nilai_CPMK"].copy()
+            target = period_data["Target"].copy()
         except Exception as exc:  # pragma: no cover - shown to Streamlit users
-            validation_errors.append(f"{item['periode']}: file tidak dapat dibaca. Detail: {exc}")
+            validation_errors.append(f"{periode}: {exc}")
             continue
-        errors = validate_workbook(data, item["periode"])
-        if errors:
-            validation_errors.extend(errors)
-            continue
-        validation_warnings.extend(get_workbook_warnings(data, item["periode"]))
-        format_messages.extend(f"{item['periode']}: {message}" for message in get_format_messages(data))
-        period_results.append(calculate_period_result(item["periode"], data))
+
+        if base_data is None:
+            base_data = {
+                "Master_CPL": master_cpl,
+                "Master_IK": master_ik,
+                "Mapping_CPMK": mapping_cpmk,
+                "Target": target,
+            }
+
+        nilai_cpmk["Periode"] = periode
+        nilai_frames.append(nilai_cpmk)
+        period_labels.append(periode)
+        validation_warnings.extend(get_workbook_warnings(period_data, periode))
+        format_messages.extend(f"{periode}: {message}" for message in get_format_messages(period_data))
+
+    if not nilai_frames or base_data is None:
+        st.error("Tidak ada data periode yang berhasil dibaca.")
+        for error in validation_errors:
+            st.write(f"- {error}")
+        return
+
+    combined_nilai_cpmk = pd.concat(nilai_frames, ignore_index=True)
+    for periode in period_labels:
+        period_nilai = combined_nilai_cpmk[
+            combined_nilai_cpmk["Periode"].astype(str) == str(periode)
+        ].copy()
+        period_data = {sheet: frame.copy() for sheet, frame in base_data.items()}
+        period_data["Nilai_CPMK"] = period_nilai
+        try:
+            period_results.append(calculate_period_result(periode, period_data))
+        except Exception as exc:  # pragma: no cover - shown to Streamlit users
+            validation_errors.append(f"{periode}: {exc}")
 
     if validation_errors:
         st.error("Ada data periode yang belum sesuai.")
         for error in validation_errors:
             st.write(f"- {error}")
-        return
+        if not period_results:
+            return
     for message in format_messages:
         st.success(message)
     if validation_warnings:
@@ -2350,7 +2619,26 @@ def render_multi_mode() -> None:
     cqi_all_raw = pd.concat([result["cqi"] for result in period_results], ignore_index=True)
     detail_frames = [result["detail_asesmen"] for result in period_results if "detail_asesmen" in result]
     detail_asesmen_all = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame()
-    period_order = [item["periode"] for item in uploads]
+    student_data_results = [
+        result["student_data"]
+        for result in period_results
+        if isinstance(result.get("student_data"), dict)
+    ]
+    student_data_all = {}
+    if student_data_results:
+        student_data_all = {
+            "Master_CPL": student_data_results[0]["Master_CPL"],
+            "Mapping_CPMK": pd.concat(
+                [student_data["Mapping_CPMK"] for student_data in student_data_results],
+                ignore_index=True,
+            ),
+            "Nilai_CPMK": pd.concat(
+                [student_data["Nilai_CPMK"] for student_data in student_data_results],
+                ignore_index=True,
+            ),
+            "Target": student_data_results[0]["Target"],
+        }
+    period_order = period_labels
 
     filter_source = {"Mapping_CPMK": rekap_cpmk_all}
     if not detail_asesmen_all.empty:
@@ -2393,11 +2681,22 @@ def render_multi_mode() -> None:
     tab_names.extend(["CQI", "Evaluasi CQI", "Panduan Input Data"])
     tabs = st.tabs(tab_names)
     with tabs[0]:
-        selected_period = st.selectbox("Pilih periode dashboard", period_order, index=len(period_order) - 1)
-        render_dashboard(
-            rekap_cpl_all[rekap_cpl_all["Periode"] == selected_period],
-            rekap_ik_all[rekap_ik_all["Periode"] == selected_period],
+        analysis_view = st.radio(
+            "Pilihan Analisis",
+            ["Ringkasan CPL", "Radar CPL Per Mahasiswa"],
+            horizontal=True,
+            key="multi_dashboard_analysis_view",
         )
+        if analysis_view == "Ringkasan CPL":
+            selected_period = st.selectbox("Pilih periode dashboard", period_order, index=len(period_order) - 1)
+            render_dashboard(
+                rekap_cpl_all[rekap_cpl_all["Periode"] == selected_period],
+                rekap_ik_all[rekap_ik_all["Periode"] == selected_period],
+            )
+        elif student_data_all:
+            render_student_cpl_radar(student_data_all, "multi_student_cpl", show_period_filter=True)
+        else:
+            st.info("Belum ada data mahasiswa yang dapat ditampilkan sebagai Radar CPL.")
     with tabs[1]:
         st.dataframe(format_display(rekap_cpmk_all), use_container_width=True, hide_index=True)
     with tabs[2]:

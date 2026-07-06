@@ -12,6 +12,32 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
+CPL_STUDENT_ACHIEVEMENT_THRESHOLD = 73.0
+CPL_PERCENT_TARGET = 70.0
+
+
+def classify_cpl_status(percent):
+    if percent >= 80:
+        return "Melampaui"
+    elif percent >= 70:
+        return "Memenuhi Target"
+    else:
+        return "Perlu Perhatian"
+
+
+def classify_cpmk_achievement(percent):
+    if percent >= 80:
+        return "Sangat Baik"
+    elif percent >= 70:
+        return "Baik"
+    elif percent >= 55:
+        return "Cukup"
+    elif percent >= 39:
+        return "Kurang"
+    else:
+        return "Sangat Kurang"
+
+
 APP_TITLE = "Dashboard Asesmen CPL dan CQI D3 Teknik Elektronika"
 
 REQUIRED_SHEETS = {
@@ -124,6 +150,8 @@ RECOMMENDATIONS = {
 }
 
 STATUS_COLORS = {
+    "Melampaui": "#2563eb",
+    "Memenuhi Target": "#1f9d55",
     "Tercapai": "#1f9d55",
     "Perlu Perhatian": "#d89b00",
     "Belum Tercapai": "#d64545",
@@ -1444,7 +1472,8 @@ def calculate_all(
 
 
 CPL_RADAR_CODES = [f"CPL{index:02d}" for index in range(1, 11)]
-STUDENT_CPL_TARGET = 50.0
+STUDENT_CPL_TARGET = CPL_STUDENT_ACHIEVEMENT_THRESHOLD
+STUDENT_CPL_COMPARISON_TARGET = CPL_STUDENT_ACHIEVEMENT_THRESHOLD + 1e-9
 
 
 def canonical_cpl_radar_code(value: object) -> str:
@@ -2851,6 +2880,257 @@ def main() -> None:
         render_single_mode()
     else:
         render_multi_mode()
+
+
+def prepare_student_cpl_source_from_frames(nilai_df, mapping_df):
+    nilai = nilai_df.copy()
+    mapping = mapping_df.copy()
+    if "Bobot_CPMK_Bersih" not in mapping.columns and "Bobot CPMK" in mapping.columns:
+        mapping["Bobot_CPMK_Bersih"] = clean_weight_series(mapping["Bobot CPMK"])
+    if "Bobot CPMK" not in nilai.columns:
+        merge_columns = ["Kode MK", "Kode CPMK"]
+        for optional_column in ["Bobot CPMK", "Bobot_CPMK_Bersih"]:
+            if optional_column in mapping.columns:
+                merge_columns.append(optional_column)
+        nilai = nilai.merge(
+            mapping[merge_columns],
+            on=["Kode MK", "Kode CPMK"],
+            how="left",
+        )
+    if "Bobot_CPMK_Bersih" not in nilai.columns:
+        if "Bobot CPMK" in nilai.columns:
+            nilai["Bobot_CPMK_Bersih"] = clean_weight_series(nilai["Bobot CPMK"])
+        else:
+            nilai["Bobot_CPMK_Bersih"] = 1
+    if "Nilai_Bersih" not in nilai.columns:
+        nilai["Nilai_Bersih"] = clamp_score(nilai["Nilai"])
+    nilai["Kode CPL Radar"] = nilai["Kode CPL"].apply(canonical_cpl_radar_code)
+    return nilai
+
+
+def calculate_student_cpl_table_from_source(source):
+    if source.empty:
+        return pd.DataFrame(columns=["NIM", "Nama Mahasiswa", "Kode CPL Radar", "Nilai CPL"])
+    group_cols = ["NIM", "Nama Mahasiswa", "Kode CPL Radar"]
+    for optional_col in ["Kelas", "Periode"]:
+        if optional_col in source.columns:
+            group_cols.insert(-1, optional_col)
+    rows = []
+    for group_keys, group in source.groupby(group_cols, dropna=False):
+        if not isinstance(group_keys, tuple):
+            group_keys = (group_keys,)
+        row = dict(zip(group_cols, group_keys))
+        row["Nilai CPL"] = weighted_mean_0_100(group, "Nilai_Bersih", "Bobot_CPMK_Bersih")
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    result["Nilai CPL"] = clamp_score(result["Nilai CPL"]).fillna(0)
+    return result
+
+
+def calculate_student_cpl_table(data):
+    prepared = prepare_data(data)
+    source = prepare_student_cpl_source_from_frames(prepared["Nilai_CPMK"], prepared["Mapping_CPMK"])
+    return calculate_student_cpl_table_from_source(source)
+
+
+class CPLRekapDataFrame(pd.DataFrame):
+    @property
+    def _constructor(self):
+        return CPLRekapDataFrame
+
+    def _with_compat_columns(self):
+        frame = pd.DataFrame(self)
+        if "Capaian CPL" not in frame.columns and "Persentase Ketercapaian (%)" in frame.columns:
+            frame["Capaian CPL"] = frame["Persentase Ketercapaian (%)"]
+        if "Target" not in frame.columns:
+            frame["Target"] = CPL_PERCENT_TARGET
+        return frame
+
+    def __getitem__(self, key):
+        if isinstance(key, str) and key == "Capaian CPL" and "Capaian CPL" not in self.columns:
+            return super().__getitem__("Persentase Ketercapaian (%)")
+        if isinstance(key, str) and key == "Target" and "Target" not in self.columns:
+            return pd.Series(CPL_PERCENT_TARGET, index=self.index, name="Target")
+        if isinstance(key, str) and key == "Status":
+            return CPLStatusSeries(super().__getitem__(key))
+        if isinstance(key, list) and any(item in {"Capaian CPL", "Target"} for item in key):
+            return self._with_compat_columns()[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key in {"Capaian CPL", "Target"}:
+            return self[key]
+        return super().get(key, default)
+
+
+class CPLStatusSeries(pd.Series):
+    @property
+    def _constructor(self):
+        return CPLStatusSeries
+
+    def __eq__(self, other):
+        if other == "Tercapai":
+            return self.isin(["Memenuhi Target", "Melampaui", "Tercapai"])
+        if other == "Belum Tercapai":
+            return self.isin(["Perlu Perhatian", "Belum Tercapai"])
+        return super().__eq__(other)
+
+    def __ne__(self, other):
+        return ~(self.__eq__(other))
+
+
+def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=None, mapping_cpmk=None):
+    cpl_rows = []
+    for kode_cpl, group in rekap_ik.groupby("Kode CPL", dropna=False):
+        working = group.copy()
+        if "Total Bobot CPMK" not in working.columns or pd.to_numeric(working["Total Bobot CPMK"], errors="coerce").fillna(0).sum() <= 0:
+            working["Total Bobot CPMK"] = 1
+        cpl_rows.append({
+            "Kode CPL": kode_cpl,
+            "Rata-rata Nilai CPL": weighted_mean_0_100(working, "Capaian IK", "Total Bobot CPMK"),
+        })
+
+    cpl_values = pd.DataFrame(cpl_rows)
+    rekap = master_cpl.merge(cpl_values, on="Kode CPL", how="left")
+    rekap["Rata-rata Nilai CPL"] = pd.to_numeric(rekap["Rata-rata Nilai CPL"], errors="coerce").fillna(0)
+    rekap["Jumlah Mahasiswa"] = 0
+    rekap["Jumlah Mahasiswa Mencapai"] = 0
+    rekap["Persentase Ketercapaian (%)"] = 0.0
+
+    if nilai_cpmk is not None and mapping_cpmk is not None:
+        student_source = prepare_student_cpl_source_from_frames(nilai_cpmk, mapping_cpmk)
+        student_cpl = calculate_student_cpl_table_from_source(student_source)
+        if not student_cpl.empty:
+            student_summary = (
+                student_cpl.groupby("Kode CPL Radar", dropna=False)
+                .agg(
+                    **{
+                        "Jumlah Mahasiswa": ("NIM", "nunique"),
+                        "Jumlah Mahasiswa Mencapai": ("Nilai CPL", lambda values: int((pd.to_numeric(values, errors="coerce") > CPL_STUDENT_ACHIEVEMENT_THRESHOLD).sum())),
+                    }
+                )
+                .reset_index()
+            )
+            student_summary["Persentase Ketercapaian (%)"] = (
+                student_summary["Jumlah Mahasiswa Mencapai"]
+                / student_summary["Jumlah Mahasiswa"].replace(0, pd.NA)
+                * 100
+            ).fillna(0).clip(lower=0, upper=100)
+            rekap["Kode CPL Radar"] = rekap["Kode CPL"].apply(canonical_cpl_radar_code)
+            rekap = rekap.drop(columns=["Jumlah Mahasiswa", "Jumlah Mahasiswa Mencapai", "Persentase Ketercapaian (%)"])
+            rekap = rekap.merge(student_summary, on="Kode CPL Radar", how="left").drop(columns=["Kode CPL Radar"])
+
+    for column in ["Jumlah Mahasiswa", "Jumlah Mahasiswa Mencapai", "Persentase Ketercapaian (%)"]:
+        rekap[column] = pd.to_numeric(rekap[column], errors="coerce").fillna(0)
+    rekap["Jumlah Mahasiswa"] = rekap["Jumlah Mahasiswa"].astype(int)
+    rekap["Jumlah Mahasiswa Mencapai"] = rekap["Jumlah Mahasiswa Mencapai"].astype(int)
+    rekap = clamp_rekap_scores(rekap, ["Rata-rata Nilai CPL", "Persentase Ketercapaian (%)"])
+    rekap["Kriteria"] = rekap["Persentase Ketercapaian (%)"].apply(classify_cpmk_achievement)
+    rekap["Status"] = rekap["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    ordered_columns = [
+        "Kode CPL",
+        "Rumusan CPL",
+        "Rata-rata Nilai CPL",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+    ]
+    return CPLRekapDataFrame(rekap[ordered_columns].sort_values("Kode CPL"))
+
+
+def _get_result_item(result, keys):
+    if not isinstance(result, dict):
+        return None
+    for key in keys:
+        if key in result:
+            return result[key]
+    return None
+
+
+_calculate_all_base = calculate_all
+
+
+def calculate_all(data, *args, **kwargs):
+    result = _calculate_all_base(data, *args, **kwargs)
+    if not isinstance(result, dict):
+        return result
+
+    prepared = _get_result_item(result, ["prepared", "prepared_data", "data_prepared"])
+    if prepared is None:
+        prepared = prepare_data(data)
+
+    rekap_ik = _get_result_item(result, ["rekap_ik", "Rekap IK"])
+    if rekap_ik is None:
+        return result
+
+    target_cpl = kwargs.get("target_cpl", kwargs.get("target_ketercapaian", CPL_PERCENT_TARGET))
+    if len(args) >= 2:
+        target_cpl = args[1]
+
+    rekap_cpl = calculate_rekap_cpl(
+        rekap_ik,
+        prepared["Master_CPL"],
+        target_cpl,
+        prepared["Nilai_CPMK"],
+        prepared["Mapping_CPMK"],
+    )
+
+    for key in ["rekap_cpl", "Rekap CPL"]:
+        if key in result:
+            result[key] = rekap_cpl
+    if "rekap_cpl" not in result and "Rekap CPL" not in result:
+        result["rekap_cpl"] = rekap_cpl
+    return result
+
+
+CPL_STATUS_NOTE = (
+    "Status CPL ditentukan berdasarkan persentase mahasiswa dengan nilai CPMK > 73. "
+    "Status Perlu Perhatian jika <70%, Memenuhi Target jika 70%–<81%, dan Melampaui jika ≥81%."
+)
+
+
+if "clamp_score" not in globals():
+    def clamp_score(series_or_value):
+        return pd.to_numeric(series_or_value, errors="coerce").clip(lower=0, upper=100)
+
+
+if "clean_weight_series" not in globals():
+    def clean_weight_series(series_or_value):
+        weights = pd.to_numeric(series_or_value, errors="coerce")
+        return weights.where(weights > 0, 1)
+
+
+if "weighted_mean_0_100" not in globals():
+    def weighted_mean_0_100(df, value_col="Nilai_Bersih", weight_col="Bobot_CPMK_Bersih"):
+        values = pd.to_numeric(df[value_col], errors="coerce").clip(lower=0, upper=100)
+        weights = pd.to_numeric(df[weight_col], errors="coerce")
+        weights = weights.where(weights > 0, 1)
+        if weights.sum() <= 0:
+            result = values.mean()
+        else:
+            result = (values * weights).sum() / weights.sum()
+        return max(0, min(100, result))
+
+
+if "clamp_rekap_scores" not in globals():
+    def clamp_rekap_scores(df, columns):
+        result = df.copy()
+        for column in columns:
+            if column in result.columns:
+                result[column] = clamp_score(result[column])
+        return result
+
+
+if "render_dashboard" in globals():
+    _render_dashboard_base = render_dashboard
+
+    def render_dashboard(*args, **kwargs):
+        st.info(CPL_STATUS_NOTE)
+        return _render_dashboard_base(*args, **kwargs)
 
 
 if __name__ == "__main__":

@@ -1384,8 +1384,64 @@ def make_root_cause(status: str) -> str:
     )
 
 
+def pick_existing_column(row_or_df, candidates: List[str]) -> Optional[str]:
+    for column in candidates:
+        if column in row_or_df:
+            return column
+    return None
+
+
+def safe_numeric_value(value: object, default: float = 0.0) -> float:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return default
+    return float(numeric)
+
+
+def get_cpl_actual_value(row_or_df, default: float = 0.0) -> float:
+    column = pick_existing_column(row_or_df, ["Rata-rata Nilai CPL", "Capaian CPL"])
+    if column is None:
+        return default
+    return safe_numeric_value(row_or_df[column], default)
+
+
+def get_cpl_percentage_value(row_or_df, default: float = 0.0) -> float:
+    column = pick_existing_column(
+        row_or_df,
+        ["Persentase Ketercapaian (%)", "Persentase Ketercapaian", "Ketercapaian (%)", "Capaian CPL"],
+    )
+    if column is None:
+        return default
+    return safe_numeric_value(row_or_df[column], default)
+
+
 def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> pd.DataFrame:
-    needs_attention = rekap_cpl[rekap_cpl["Status"].isin(["Perlu Perhatian", "Belum Tercapai"])].copy()
+    status_column = pick_existing_column(rekap_cpl, ["Status"])
+    if status_column is None:
+        st.warning("Kolom Status pada Rekap CPL tidak ditemukan. CQI ditampilkan kosong.")
+        return pd.DataFrame(
+            columns=[
+                "Kode CPL",
+                "Rumusan CPL",
+                "Capaian Aktual",
+                "Persentase Ketercapaian",
+                "Target",
+                "Kriteria",
+                "Status",
+                "Status Awal",
+                "Indikator Lemah",
+                "Dugaan Akar Penyebab",
+                "Rekomendasi CQI",
+                "Rekomendasi tindak lanjut",
+                "PIC",
+                "Target Waktu",
+                "Status Tindak Lanjut",
+            ]
+        )
+
+    needs_attention = rekap_cpl[
+        rekap_cpl[status_column].isin(["Perlu Perhatian", "Belum Tercapai"])
+    ].copy()
     rows = []
     for _, cpl in needs_attention.iterrows():
         kode_cpl = cpl["Kode CPL"]
@@ -1400,13 +1456,15 @@ def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> pd.DataFram
         rows.append(
             {
                 "Kode CPL": kode_cpl,
-                "Rumusan CPL": cpl["Rumusan CPL"],
-                "Capaian Aktual": round(float(cpl["Capaian CPL"]), 2),
-                "Target": round(float(cpl["Target"]), 2),
-                "Status": cpl["Status"],
-                "Status Awal": cpl["Status"],
+                "Rumusan CPL": cpl.get("Rumusan CPL", ""),
+                "Capaian Aktual": round(get_cpl_actual_value(cpl), 2),
+                "Persentase Ketercapaian": round(get_cpl_percentage_value(cpl), 2),
+                "Target": round(safe_numeric_value(cpl.get("Target", 0)), 2),
+                "Kriteria": cpl.get("Kriteria", ""),
+                "Status": cpl.get(status_column, "Tidak Diketahui"),
+                "Status Awal": cpl.get(status_column, "Tidak Diketahui"),
                 "Indikator Lemah": ", ".join(weak_labels) if weak_labels else "-",
-                "Dugaan Akar Penyebab": make_root_cause(cpl["Status"]),
+                "Dugaan Akar Penyebab": make_root_cause(cpl.get(status_column, "")),
                 "Rekomendasi CQI": recommendation,
                 "Rekomendasi tindak lanjut": recommendation,
                 "PIC": "Koordinator Prodi / Tim Kurikulum / Dosen Pengampu",
@@ -1420,7 +1478,9 @@ def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> pd.DataFram
             "Kode CPL",
             "Rumusan CPL",
             "Capaian Aktual",
+            "Persentase Ketercapaian",
             "Target",
+            "Kriteria",
             "Status",
             "Status Awal",
             "Indikator Lemah",
@@ -1711,13 +1771,30 @@ def calculate_period_result(period_label: str, data: Dict[str, pd.DataFrame]) ->
 def make_trend_cpl(rekap_cpl_all: pd.DataFrame) -> pd.DataFrame:
     if rekap_cpl_all.empty:
         return pd.DataFrame()
-    return (
-        rekap_cpl_all[
-            ["Periode", "Tahun Akademik", "Semester", "Kode CPL", "Rumusan CPL", "Capaian CPL", "Target", "Status"]
-        ]
-        .rename(columns={"Capaian CPL": "Capaian Aktual"})
-        .reset_index(drop=True)
+    frame = rekap_cpl_all.copy()
+    capaian_column = pick_existing_column(
+        frame,
+        ["Rata-rata Nilai CPL", "Capaian CPL", "Persentase Ketercapaian (%)", "Persentase Ketercapaian", "Ketercapaian (%)"],
     )
+    frame["Capaian Aktual"] = (
+        pd.to_numeric(frame[capaian_column], errors="coerce").fillna(0)
+        if capaian_column
+        else 0
+    )
+    output_columns = [
+        "Periode",
+        "Tahun Akademik",
+        "Semester",
+        "Kode CPL",
+        "Rumusan CPL",
+        "Capaian Aktual",
+        "Target",
+        "Status",
+    ]
+    for column in output_columns:
+        if column not in frame.columns:
+            frame[column] = ""
+    return frame[output_columns].reset_index(drop=True)
 
 
 def make_trend_ik(rekap_ik_all: pd.DataFrame) -> pd.DataFrame:
@@ -1786,8 +1863,8 @@ def add_cqi_tracking(cqi_all: pd.DataFrame, rekap_cpl_all: pd.DataFrame, period_
                 & (rekap_cpl_all["Kode CPL"] == row["Kode CPL"])
             ]
             if not match.empty:
-                next_value = float(match.iloc[0]["Capaian CPL"])
-                change = next_value - float(row["Capaian Aktual"])
+                next_value = get_cpl_actual_value(match.iloc[0])
+                change = next_value - safe_numeric_value(row.get("Capaian Aktual", 0))
         effectiveness = effectiveness_label(change)
         enriched = row.to_dict()
         enriched["Capaian Semester Berikutnya"] = round(next_value, 2) if next_value is not None else None
@@ -1824,8 +1901,8 @@ def make_cqi_evaluation(
         ]
         if match.empty:
             continue
-        capaian_awal = float(row["Capaian Aktual"])
-        capaian_berikut = float(match.iloc[0]["Capaian CPL"])
+        capaian_awal = safe_numeric_value(row.get("Capaian Aktual", 0))
+        capaian_berikut = get_cpl_actual_value(match.iloc[0])
         change = capaian_berikut - capaian_awal
         effectiveness = effectiveness_label(change)
         rows.append(
@@ -2089,6 +2166,9 @@ def format_display(df: pd.DataFrame) -> pd.DataFrame:
         "Capaian IK",
         "Capaian CPL",
         "Capaian Aktual",
+        "Persentase Ketercapaian",
+        "Persentase Ketercapaian (%)",
+        "Rata-rata Nilai CPL",
         "Capaian Awal",
         "Capaian Berikut",
         "Capaian Semester Berikutnya",
@@ -2104,6 +2184,9 @@ def format_display(df: pd.DataFrame) -> pd.DataFrame:
         "Capaian IK",
         "Capaian CPL",
         "Capaian Aktual",
+        "Persentase Ketercapaian",
+        "Persentase Ketercapaian (%)",
+        "Rata-rata Nilai CPL",
         "Capaian Awal",
         "Capaian Berikut",
         "Capaian Semester Berikutnya",
@@ -2282,7 +2365,19 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
     achieved = int(status_counts.get("Tercapai", 0))
     attention = int(status_counts.get("Perlu Perhatian", 0))
     not_achieved = int(status_counts.get("Belum Tercapai", 0))
-    average_cpl = float(pd.to_numeric(rekap_cpl["Capaian CPL"], errors="coerce").mean())
+    cpl_display = rekap_cpl.copy()
+    cpl_value_column = pick_existing_column(
+        cpl_display,
+        ["Rata-rata Nilai CPL", "Capaian CPL", "Persentase Ketercapaian (%)", "Persentase Ketercapaian", "Ketercapaian (%)"],
+    )
+    if cpl_value_column is None:
+        st.warning("Kolom capaian CPL tidak ditemukan. Dashboard menggunakan nilai 0.")
+        cpl_display["Nilai Dashboard CPL"] = 0.0
+    else:
+        cpl_display["Nilai Dashboard CPL"] = pd.to_numeric(
+            cpl_display[cpl_value_column], errors="coerce"
+        ).fillna(0)
+    average_cpl = float(cpl_display["Nilai Dashboard CPL"].mean())
     if pd.isna(average_cpl):
         average_cpl = 0.0
 
@@ -2309,11 +2404,11 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
     render_dashboard_narrative(average_cpl, achieved, attention, not_achieved)
 
     bar = px.bar(
-        rekap_cpl,
+        cpl_display,
         x="Kode CPL",
-        y="Capaian CPL",
+        y="Nilai Dashboard CPL",
         color="Status",
-        text=rekap_cpl["Capaian CPL"].round(1),
+        text=cpl_display["Nilai Dashboard CPL"].round(1),
         color_discrete_map=STATUS_COLORS,
         range_y=[0, 100],
         title="Capaian CPL",
@@ -2322,9 +2417,9 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
     bar.update_layout(yaxis_title="Capaian (%)", xaxis_title="CPL", legend_title_text="Status")
     st.plotly_chart(bar, use_container_width=True)
 
-    radar_df = rekap_cpl.sort_values("Kode CPL", key=lambda col: col.map(sort_cpl_key))
+    radar_df = cpl_display.sort_values("Kode CPL", key=lambda col: col.map(sort_cpl_key))
     theta = radar_df["Kode CPL"].tolist()
-    values = radar_df["Capaian CPL"].round(2).tolist()
+    values = radar_df["Nilai Dashboard CPL"].round(2).tolist()
     if values:
         radar = go.Figure()
         radar.add_trace(

@@ -2820,7 +2820,7 @@ def render_single_mode() -> None:
     with tabs[3]:
         st.dataframe(format_display(rekap_cpl), use_container_width=True, hide_index=True)
     with tabs[4]:
-        render_trend_cpl(rekap_cpmk)
+        render_trend_cpl(rekap_cpl)
     with tabs[5]:
         render_trend_ik(trend_ik)
     next_index = 6
@@ -3002,7 +3002,7 @@ def render_multi_mode() -> None:
         rekap_cpmk_all,
         rekap_ik_all,
         rekap_cpl_all,
-        rekap_cpmk_all,
+        trend_cpl,
         trend_ik,
         cqi_all,
         evaluasi_cqi,
@@ -3044,7 +3044,7 @@ def render_multi_mode() -> None:
     with tabs[3]:
         st.dataframe(format_display(rekap_cpl_all), use_container_width=True, hide_index=True)
     with tabs[4]:
-        render_trend_cpl(rekap_cpmk_all)
+        render_trend_cpl(rekap_cpl_all)
     with tabs[5]:
         render_trend_ik(trend_ik)
     next_index = 6
@@ -3406,12 +3406,706 @@ if "clamp_rekap_scores" not in globals():
         return result
 
 
-if "render_dashboard" in globals():
-    _render_dashboard_base = render_dashboard
+def _final_percent_column(df: pd.DataFrame) -> Optional[str]:
+    return pick_existing_column(
+        df,
+        ["Persentase Ketercapaian (%)", "Persentase Ketercapaian", "Ketercapaian (%)"],
+    )
 
-    def render_dashboard(*args, **kwargs):
-        st.info(CPL_STATUS_NOTE)
-        return _render_dashboard_base(*args, **kwargs)
+
+def _final_numeric_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column in df.columns:
+        return pd.to_numeric(df[column], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _final_cpl_master(master_cpl: pd.DataFrame) -> pd.DataFrame:
+    base = pd.DataFrame({"Kode CPL": CPL_RADAR_CODES})
+    if master_cpl is None or master_cpl.empty:
+        base["Rumusan CPL"] = "-"
+        return base
+
+    master = master_cpl.copy()
+    if "Kode CPL" not in master.columns:
+        master["Kode CPL"] = ""
+    if "Rumusan CPL" not in master.columns:
+        master["Rumusan CPL"] = "-"
+    master["Kode CPL"] = master["Kode CPL"].map(canonical_cpl_radar_code)
+    master = master[["Kode CPL", "Rumusan CPL"]].drop_duplicates("Kode CPL")
+    base = base.merge(master, on="Kode CPL", how="left")
+    base["Rumusan CPL"] = base["Rumusan CPL"].fillna("-")
+    return base
+
+
+def calculate_rekap_ik_from_students(nilai_df, mapping_df, master_ik, target_ketercapaian):
+    student_ik = calculate_student_ik_table_from_frames(nilai_df, mapping_df)
+    master = master_ik.copy() if master_ik is not None else pd.DataFrame()
+    for column in ["Kode CPL", "Kode IK", "Notasi IK", "Rumusan IK"]:
+        if column not in master.columns:
+            master[column] = ""
+    master["Kode CPL"] = master["Kode CPL"].map(canonical_cpl_radar_code)
+    master = master[["Kode CPL", "Kode IK", "Notasi IK", "Rumusan IK"]].drop_duplicates(
+        ["Kode CPL", "Kode IK"]
+    )
+
+    if student_ik.empty:
+        rekap = master.copy()
+        rekap["Capaian IK"] = 0.0
+        rekap["Jumlah Mahasiswa"] = 0
+        rekap["Jumlah Mahasiswa Mencapai"] = 0
+        rekap["Persentase Ketercapaian (%)"] = 0.0
+    else:
+        working = student_ik.copy()
+        working["Kode CPL"] = working["Kode CPL"].map(canonical_cpl_radar_code)
+        working["Nilai IK"] = pd.to_numeric(working["Nilai IK"], errors="coerce").fillna(0).clip(0, 100)
+        summary = (
+            working.groupby(["Kode CPL", "Kode IK"], dropna=False)
+            .agg(
+                **{
+                    "Capaian IK": ("Nilai IK", "mean"),
+                    "Jumlah Mahasiswa": ("NIM", "nunique"),
+                    "Jumlah Mahasiswa Mencapai": (
+                        "Nilai IK",
+                        lambda values: int(
+                            (pd.to_numeric(values, errors="coerce") > CPL_STUDENT_ACHIEVEMENT_THRESHOLD).sum()
+                        ),
+                    ),
+                }
+            )
+            .reset_index()
+        )
+        summary["Persentase Ketercapaian (%)"] = (
+            summary["Jumlah Mahasiswa Mencapai"]
+            / summary["Jumlah Mahasiswa"].replace(0, pd.NA)
+            * 100
+        ).fillna(0)
+        rekap = master.merge(summary, on=["Kode CPL", "Kode IK"], how="left")
+
+    for column in ["Capaian IK", "Persentase Ketercapaian (%)"]:
+        rekap[column] = pd.to_numeric(rekap[column], errors="coerce").fillna(0).clip(0, 100)
+    for column in ["Jumlah Mahasiswa", "Jumlah Mahasiswa Mencapai"]:
+        rekap[column] = pd.to_numeric(rekap[column], errors="coerce").fillna(0).astype(int)
+    rekap["Jumlah Mahasiswa Mencapai"] = rekap[
+        ["Jumlah Mahasiswa Mencapai", "Jumlah Mahasiswa"]
+    ].min(axis=1)
+    rekap["Persentase Ketercapaian"] = rekap["Persentase Ketercapaian (%)"]
+    rekap["Kriteria"] = rekap["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    rekap["Status"] = rekap["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    rekap["Target"] = target_ketercapaian
+    rekap["Total Bobot CPMK"] = 1
+    ordered_columns = [
+        "Kode CPL",
+        "Kode IK",
+        "Notasi IK",
+        "Rumusan IK",
+        "Capaian IK",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+        "Persentase Ketercapaian",
+        "Target",
+        "Total Bobot CPMK",
+    ]
+    return rekap[ordered_columns].sort_values(["Kode CPL", "Kode IK"]).reset_index(drop=True)
+
+
+def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=None, mapping_cpmk=None):
+    rekap = _final_cpl_master(master_cpl)
+    rekap["Rata-rata Nilai CPL"] = 0.0
+    rekap["Jumlah Mahasiswa"] = 0
+    rekap["Jumlah Mahasiswa Mencapai"] = 0
+    rekap["Persentase Ketercapaian (%)"] = 0.0
+
+    if nilai_cpmk is not None and mapping_cpmk is not None:
+        student_source = prepare_student_cpl_source_from_frames(nilai_cpmk, mapping_cpmk)
+        student_cpl = calculate_student_cpl_table_from_source(student_source)
+        if not student_cpl.empty:
+            student_cpl = student_cpl.copy()
+            student_cpl["Kode CPL"] = student_cpl["Kode CPL Radar"].map(canonical_cpl_radar_code)
+            student_cpl["Nilai CPL"] = pd.to_numeric(student_cpl["Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
+            summary = (
+                student_cpl.groupby("Kode CPL", dropna=False)
+                .agg(
+                    **{
+                        "Rata-rata Nilai CPL": ("Nilai CPL", "mean"),
+                        "Jumlah Mahasiswa": ("NIM", "nunique"),
+                        "Jumlah Mahasiswa Mencapai": (
+                            "Nilai CPL",
+                            lambda values: int(
+                                (pd.to_numeric(values, errors="coerce") > CPL_STUDENT_ACHIEVEMENT_THRESHOLD).sum()
+                            ),
+                        ),
+                    }
+                )
+                .reset_index()
+            )
+            summary["Persentase Ketercapaian (%)"] = (
+                summary["Jumlah Mahasiswa Mencapai"]
+                / summary["Jumlah Mahasiswa"].replace(0, pd.NA)
+                * 100
+            ).fillna(0)
+            rekap = rekap.drop(
+                columns=[
+                    "Rata-rata Nilai CPL",
+                    "Jumlah Mahasiswa",
+                    "Jumlah Mahasiswa Mencapai",
+                    "Persentase Ketercapaian (%)",
+                ],
+                errors="ignore",
+            ).merge(summary, on="Kode CPL", how="left")
+    elif rekap_ik is not None and not rekap_ik.empty:
+        ik = rekap_ik.copy()
+        ik["Kode CPL"] = ik["Kode CPL"].map(canonical_cpl_radar_code)
+        percent_col = _final_percent_column(ik) or "Capaian IK"
+        ik["Capaian IK"] = _final_numeric_series(ik, "Capaian IK").clip(0, 100)
+        ik[percent_col] = pd.to_numeric(ik[percent_col], errors="coerce").fillna(0).clip(0, 100)
+        summary = (
+            ik.groupby("Kode CPL", dropna=False)
+            .agg(
+                **{
+                    "Rata-rata Nilai CPL": ("Capaian IK", "mean"),
+                    "Persentase Ketercapaian (%)": (percent_col, "mean"),
+                }
+            )
+            .reset_index()
+        )
+        rekap = rekap.drop(
+            columns=["Rata-rata Nilai CPL", "Persentase Ketercapaian (%)"], errors="ignore"
+        ).merge(summary, on="Kode CPL", how="left")
+
+    for column in ["Rata-rata Nilai CPL", "Persentase Ketercapaian (%)"]:
+        rekap[column] = pd.to_numeric(rekap[column], errors="coerce").fillna(0).clip(0, 100)
+    for column in ["Jumlah Mahasiswa", "Jumlah Mahasiswa Mencapai"]:
+        rekap[column] = pd.to_numeric(rekap[column], errors="coerce").fillna(0).astype(int)
+    rekap["Jumlah Mahasiswa Mencapai"] = rekap[
+        ["Jumlah Mahasiswa Mencapai", "Jumlah Mahasiswa"]
+    ].min(axis=1)
+    rekap["Kriteria"] = rekap["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    rekap["Status"] = rekap["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    ordered_columns = [
+        "Kode CPL",
+        "Rumusan CPL",
+        "Rata-rata Nilai CPL",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+    ]
+    return CPLRekapDataFrame(rekap[ordered_columns].sort_values("Kode CPL").reset_index(drop=True))
+
+
+def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame, rekap_cpmk: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    if rekap_cpl is None or rekap_cpl.empty:
+        return pd.DataFrame()
+
+    def cqi_rule(percent: float) -> Dict[str, str]:
+        if percent < 40:
+            return {
+                "Prioritas": "Tinggi",
+                "Temuan": "Ketercapaian CPL sangat rendah",
+                "Rekomendasi": "Revisi metode pembelajaran, asesmen, dan dukungan belajar",
+            }
+        if percent < 70:
+            return {
+                "Prioritas": "Sedang",
+                "Temuan": "Ketercapaian CPL belum memenuhi target",
+                "Rekomendasi": "Penguatan pembelajaran dan asesmen pada CPMK/IK yang lemah",
+            }
+        if percent < 81:
+            return {
+                "Prioritas": "Pemantauan",
+                "Temuan": "Ketercapaian memenuhi target minimum",
+                "Rekomendasi": "Pertahankan dan tingkatkan agar mencapai kategori melampaui",
+            }
+        return {
+            "Prioritas": "Dipertahankan",
+            "Temuan": "Ketercapaian CPL sangat baik",
+            "Rekomendasi": "Pertahankan praktik baik dan dokumentasikan",
+        }
+
+    def weakest_items(df: Optional[pd.DataFrame], kode_cpl: str, code_col: str, value_cols: List[str], limit: int = 3) -> str:
+        if df is None or df.empty or code_col not in df.columns:
+            return "-"
+        work = df.copy()
+        if "Kode CPL" not in work.columns:
+            return "-"
+        work["Kode CPL"] = work["Kode CPL"].map(canonical_cpl_radar_code)
+        work = work[work["Kode CPL"] == kode_cpl]
+        value_col = pick_existing_column(work, value_cols)
+        if work.empty or value_col is None:
+            return "-"
+        work[value_col] = pd.to_numeric(work[value_col], errors="coerce").fillna(0).clip(0, 100)
+        items = (
+            work[[code_col, value_col]]
+            .dropna(subset=[code_col])
+            .drop_duplicates(code_col)
+            .sort_values(value_col)
+            .head(limit)
+        )
+        if items.empty:
+            return "-"
+        return ", ".join(f"{row[code_col]} ({row[value_col]:.1f}%)" for _, row in items.iterrows())
+
+    rows: List[Dict[str, object]] = []
+    cpl_work = rekap_cpl.copy()
+    cpl_work["Kode CPL"] = cpl_work["Kode CPL"].map(canonical_cpl_radar_code)
+    percent_col = _final_percent_column(cpl_work)
+    actual_col = pick_existing_column(cpl_work, ["Rata-rata Nilai CPL", "Capaian CPL"])
+    for _, cpl in cpl_work.drop_duplicates("Kode CPL").iterrows():
+        kode_cpl = cpl.get("Kode CPL", "")
+        percent = safe_numeric_value(cpl, percent_col, 0.0) if percent_col else 0.0
+        actual = safe_numeric_value(cpl, actual_col, 0.0) if actual_col else 0.0
+        rule = cqi_rule(percent)
+        weak_ik = weakest_items(
+            rekap_ik,
+            kode_cpl,
+            "Kode IK",
+            ["Persentase Ketercapaian (%)", "Persentase Ketercapaian", "Capaian IK"],
+        )
+        weak_cpmk = weakest_items(
+            rekap_cpmk,
+            kode_cpl,
+            "Kode CPMK",
+            ["Persentase CPMK", "Persentase Ketercapaian CPMK (%)", "Persentase Ketercapaian (%)"],
+        )
+        focus = f"IK terendah: {weak_ik}; CPMK terendah: {weak_cpmk}"
+        rows.append(
+            {
+                "Kode CPL": kode_cpl,
+                "Rumusan CPL": cpl.get("Rumusan CPL", "-"),
+                "Rata-rata Nilai CPL": round(actual, 2),
+                "Persentase Ketercapaian (%)": round(percent, 2),
+                "Kriteria": cpl.get("Kriteria", classify_achievement(percent)),
+                "Status": cpl.get("Status", classify_cpl_status(percent)),
+                "Temuan": rule["Temuan"],
+                "Analisis Penyebab": "Capaian dipengaruhi oleh IK/CPMK dengan ketercapaian terendah pada CPL terkait.",
+                "Prioritas": rule["Prioritas"],
+                "Rekomendasi": rule["Rekomendasi"],
+                "Fokus Perbaikan": focus,
+                "Tindak Lanjut": "Dibahas pada rapat evaluasi kurikulum dan dimonitor pada periode berikutnya.",
+                "Capaian Aktual": round(actual, 2),
+                "Target": CPL_PERCENT_TARGET,
+                "Status Awal": cpl.get("Status", classify_cpl_status(percent)),
+                "Indikator Lemah": focus,
+                "Dugaan akar penyebab": "Perlu penelusuran pembelajaran, instrumen asesmen, dan dukungan belajar pada indikator lemah.",
+                "Rekomendasi tindak lanjut": rule["Rekomendasi"],
+                "PIC": "",
+                "Target waktu": "",
+                "Status tindak lanjut": "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def make_trend_cpl(rekap_cpl_all: pd.DataFrame) -> pd.DataFrame:
+    if rekap_cpl_all is None or rekap_cpl_all.empty:
+        return pd.DataFrame()
+    frame = rekap_cpl_all.copy()
+    frame["Kode CPL"] = frame["Kode CPL"].map(canonical_cpl_radar_code)
+    if "Persentase Ketercapaian (%)" not in frame.columns:
+        percent_col = _final_percent_column(frame)
+        frame["Persentase Ketercapaian (%)"] = (
+            pd.to_numeric(frame[percent_col], errors="coerce") if percent_col else 0
+        )
+    frame["Persentase Ketercapaian (%)"] = pd.to_numeric(
+        frame["Persentase Ketercapaian (%)"], errors="coerce"
+    ).fillna(0).clip(0, 100)
+    if "Rata-rata Nilai CPL" not in frame.columns:
+        frame["Rata-rata Nilai CPL"] = _final_numeric_series(frame, "Capaian CPL").clip(0, 100)
+    frame["Kriteria"] = frame.get(
+        "Kriteria", frame["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    ).fillna(frame["Persentase Ketercapaian (%)"].apply(classify_achievement))
+    frame["Status"] = frame.get(
+        "Status", frame["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    ).fillna(frame["Persentase Ketercapaian (%)"].apply(classify_cpl_status))
+    frame["Capaian Aktual"] = pd.to_numeric(frame["Rata-rata Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
+    for column in ["Periode", "Tahun Akademik", "Semester", "Rumusan CPL", "Target"]:
+        if column not in frame.columns:
+            frame[column] = CPL_PERCENT_TARGET if column == "Target" else ""
+    output_columns = [
+        "Periode",
+        "Tahun Akademik",
+        "Semester",
+        "Kode CPL",
+        "Rumusan CPL",
+        "Rata-rata Nilai CPL",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+        "Capaian Aktual",
+        "Target",
+    ]
+    for column in output_columns:
+        if column not in frame.columns:
+            frame[column] = 0 if column.startswith("Jumlah") else ""
+    return frame[output_columns].sort_values(["Periode", "Kode CPL"]).reset_index(drop=True)
+
+
+def make_trend_ik(rekap_ik_all: pd.DataFrame) -> pd.DataFrame:
+    if rekap_ik_all is None or rekap_ik_all.empty:
+        return pd.DataFrame()
+    frame = rekap_ik_all.copy()
+    frame["Kode CPL"] = frame["Kode CPL"].map(canonical_cpl_radar_code)
+    if "Persentase Ketercapaian (%)" not in frame.columns:
+        percent_col = _final_percent_column(frame)
+        frame["Persentase Ketercapaian (%)"] = (
+            pd.to_numeric(frame[percent_col], errors="coerce") if percent_col else 0
+        )
+    frame["Persentase Ketercapaian (%)"] = pd.to_numeric(
+        frame["Persentase Ketercapaian (%)"], errors="coerce"
+    ).fillna(0).clip(0, 100)
+    frame["Persentase Ketercapaian"] = frame["Persentase Ketercapaian (%)"]
+    frame["Kriteria"] = frame.get(
+        "Kriteria", frame["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    ).fillna(frame["Persentase Ketercapaian (%)"].apply(classify_achievement))
+    frame["Status"] = frame.get(
+        "Status", frame["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    ).fillna(frame["Persentase Ketercapaian (%)"].apply(classify_cpl_status))
+    for column in ["Periode", "Tahun Akademik", "Semester", "Kode IK", "Rumusan IK", "Capaian IK", "Target"]:
+        if column not in frame.columns:
+            frame[column] = CPL_PERCENT_TARGET if column == "Target" else ""
+    output_columns = [
+        "Periode",
+        "Tahun Akademik",
+        "Semester",
+        "Kode CPL",
+        "Kode IK",
+        "Rumusan IK",
+        "Capaian IK",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Persentase Ketercapaian",
+        "Kriteria",
+        "Target",
+        "Status",
+    ]
+    for column in output_columns:
+        if column not in frame.columns:
+            frame[column] = 0 if column.startswith("Jumlah") else ""
+    return frame[output_columns].sort_values(["Periode", "Kode CPL", "Kode IK"]).reset_index(drop=True)
+
+
+def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
+    st.info(CPL_STATUS_NOTE)
+    if rekap_cpl is None or rekap_cpl.empty:
+        st.info("Belum ada data Rekap CPL untuk ditampilkan.")
+        return
+
+    cpl = rekap_cpl.copy()
+    cpl["Kode CPL"] = cpl["Kode CPL"].map(canonical_cpl_radar_code)
+    cpl = pd.DataFrame({"Kode CPL": CPL_RADAR_CODES}).merge(cpl, on="Kode CPL", how="left")
+    cpl["Rata-rata Nilai CPL"] = _final_numeric_series(cpl, "Rata-rata Nilai CPL").clip(0, 100)
+    cpl["Persentase Ketercapaian (%)"] = _final_numeric_series(
+        cpl, "Persentase Ketercapaian (%)"
+    ).clip(0, 100)
+    cpl["Status"] = cpl.get("Status", cpl["Persentase Ketercapaian (%)"].apply(classify_cpl_status)).fillna(
+        cpl["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    )
+    cpl["Kriteria"] = cpl.get("Kriteria", cpl["Persentase Ketercapaian (%)"].apply(classify_achievement)).fillna(
+        cpl["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    )
+
+    status_counts = cpl["Status"].value_counts()
+    average_cpl = float(cpl["Rata-rata Nilai CPL"].mean()) if not cpl.empty else 0.0
+    cards = st.columns(4)
+    cards[0].metric("Jumlah CPL Melampaui", int(status_counts.get("Melampaui", 0)))
+    cards[1].metric("Jumlah CPL Memenuhi Target", int(status_counts.get("Memenuhi Target", 0)))
+    cards[2].metric("Jumlah CPL Perlu Perhatian", int(status_counts.get("Perlu Perhatian", 0)))
+    cards[3].metric("Rata-rata Capaian CPL", f"{average_cpl:.2f}%")
+    st.markdown(
+        f"Pada periode ini, rata-rata capaian CPL adalah **{average_cpl:.2f}%**. "
+        f"Sebanyak **{int(status_counts.get('Melampaui', 0))} CPL** melampaui, "
+        f"**{int(status_counts.get('Memenuhi Target', 0))} CPL** memenuhi target, dan "
+        f"**{int(status_counts.get('Perlu Perhatian', 0))} CPL** perlu perhatian."
+    )
+
+    status_colors = {
+        "Perlu Perhatian": "#f97316",
+        "Memenuhi Target": "#2563eb",
+        "Melampaui": "#16a34a",
+    }
+    chart = px.bar(
+        cpl,
+        x="Kode CPL",
+        y="Rata-rata Nilai CPL",
+        color="Status",
+        text=cpl["Rata-rata Nilai CPL"].round(1),
+        color_discrete_map=status_colors,
+        labels={"Rata-rata Nilai CPL": "Rata-rata Nilai CPL"},
+        title="Capaian CPL01-CPL10",
+    )
+    chart.update_traces(textposition="outside", cliponaxis=False)
+    chart.update_yaxes(range=[0, 105])
+    st.plotly_chart(chart, width="stretch")
+
+
+def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
+    if trend_cpl is None or trend_cpl.empty:
+        st.info("Belum ada data Tren CPL.")
+        return
+    df = trend_cpl.copy()
+    if "Kode CPL" not in df.columns:
+        st.warning("Data Tren CPL belum memiliki kolom Kode CPL.")
+        return
+    if "Periode" in df.columns:
+        period_options = sorted(df["Periode"].dropna().astype(str).unique().tolist())
+        if len(period_options) > 1:
+            selected_period = st.selectbox(
+                "Periode", period_options, index=len(period_options) - 1, key="trend_cpl_period_final"
+            )
+            df = df[df["Periode"].astype(str) == selected_period].copy()
+    df["Kode CPL"] = df["Kode CPL"].map(canonical_cpl_radar_code)
+    if "Persentase Ketercapaian (%)" not in df.columns:
+        percent_col = _final_percent_column(df)
+        df["Persentase Ketercapaian (%)"] = pd.to_numeric(df[percent_col], errors="coerce") if percent_col else 0
+    df["Persentase Ketercapaian (%)"] = pd.to_numeric(
+        df["Persentase Ketercapaian (%)"], errors="coerce"
+    ).fillna(0).clip(0, 100)
+    if "Rata-rata Nilai CPL" not in df.columns:
+        df["Rata-rata Nilai CPL"] = 0.0
+    df["Rata-rata Nilai CPL"] = pd.to_numeric(df["Rata-rata Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
+    df["Kriteria"] = df.get("Kriteria", df["Persentase Ketercapaian (%)"].apply(classify_achievement)).fillna(
+        df["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    )
+    df["Status"] = df.get("Status", df["Persentase Ketercapaian (%)"].apply(classify_cpl_status)).fillna(
+        df["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    )
+    df = df.sort_values("Kode CPL").drop_duplicates(["Kode CPL"], keep="first")
+
+    counts = df["Kriteria"].value_counts()
+    cols = st.columns(5)
+    for idx, label in enumerate(["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]):
+        cols[idx].metric(f"Jumlah CPL {label}", int(counts.get(label, 0)))
+
+    fig = px.bar(
+        df,
+        x="Kode CPL",
+        y="Persentase Ketercapaian (%)",
+        color="Kriteria",
+        text=df["Persentase Ketercapaian (%)"].round(1),
+        color_discrete_map=ACHIEVEMENT_COLORS,
+        title="Tren CPL berdasarkan Persentase Ketercapaian",
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_yaxes(range=[0, 105])
+    st.plotly_chart(fig, width="stretch")
+
+    table_columns = [
+        "Kode CPL",
+        "Rata-rata Nilai CPL",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+    ]
+    st.dataframe(format_display(df[[col for col in table_columns if col in df.columns]]), width="stretch", hide_index=True)
+
+
+def render_trend_ik(trend_ik: pd.DataFrame) -> None:
+    if trend_ik is None or trend_ik.empty:
+        st.info("Belum ada data Tren IK.")
+        return
+    df = trend_ik.copy()
+    if "Kode CPL" not in df.columns or "Kode IK" not in df.columns:
+        st.warning("Data Tren IK belum memiliki kolom Kode CPL dan Kode IK.")
+        return
+    if "Periode" in df.columns:
+        period_options = sorted(df["Periode"].dropna().astype(str).unique().tolist())
+        if len(period_options) > 1:
+            selected_period = st.selectbox(
+                "Periode", period_options, index=len(period_options) - 1, key="trend_ik_period_final"
+            )
+            df = df[df["Periode"].astype(str) == selected_period].copy()
+    df["Kode CPL"] = df["Kode CPL"].map(canonical_cpl_radar_code)
+    cpl_options = sorted(df["Kode CPL"].dropna().unique().tolist())
+    selected_cpl = st.selectbox("Pilih Kode CPL", cpl_options, key="trend_ik_cpl_final")
+    filtered = df[df["Kode CPL"] == selected_cpl].copy()
+    if "Persentase Ketercapaian (%)" not in filtered.columns:
+        percent_col = _final_percent_column(filtered)
+        filtered["Persentase Ketercapaian (%)"] = pd.to_numeric(filtered[percent_col], errors="coerce") if percent_col else 0
+    filtered["Persentase Ketercapaian (%)"] = pd.to_numeric(
+        filtered["Persentase Ketercapaian (%)"], errors="coerce"
+    ).fillna(0).clip(0, 100)
+    filtered["Kriteria"] = filtered.get(
+        "Kriteria", filtered["Persentase Ketercapaian (%)"].apply(classify_achievement)
+    ).fillna(filtered["Persentase Ketercapaian (%)"].apply(classify_achievement))
+    filtered["Status"] = filtered.get(
+        "Status", filtered["Persentase Ketercapaian (%)"].apply(classify_cpl_status)
+    ).fillna(filtered["Persentase Ketercapaian (%)"].apply(classify_cpl_status))
+
+    fig = px.bar(
+        filtered.sort_values("Kode IK"),
+        x="Kode IK",
+        y="Persentase Ketercapaian (%)",
+        color="Kriteria",
+        text=filtered.sort_values("Kode IK")["Persentase Ketercapaian (%)"].round(1),
+        color_discrete_map=ACHIEVEMENT_COLORS,
+        title=f"Tren IK pada {selected_cpl}",
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_yaxes(range=[0, 105])
+    st.plotly_chart(fig, width="stretch")
+
+    table_columns = [
+        "Kode IK",
+        "Rumusan IK",
+        "Capaian IK",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+    ]
+    st.dataframe(
+        format_display(filtered[[col for col in table_columns if col in filtered.columns]].sort_values("Kode IK")),
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def render_student_cpl_radar(
+    data: Dict[str, pd.DataFrame],
+    key_prefix: str,
+    show_period_filter: bool = False,
+) -> None:
+    student_cpl = calculate_student_cpl_table(data)
+    if student_cpl.empty:
+        st.info("Belum ada data nilai mahasiswa yang dapat ditampilkan sebagai Radar CPL.")
+        return
+
+    filtered = student_cpl.copy()
+    filter_cols = st.columns(3 if show_period_filter else 2)
+    col_index = 0
+    selected_period = None
+    if show_period_filter and "Periode" in filtered.columns:
+        period_options = sorted(filtered["Periode"].dropna().astype(str).unique().tolist())
+        selected_period = filter_cols[col_index].selectbox("Periode", period_options, key=f"{key_prefix}_periode")
+        filtered = filtered[filtered["Periode"].astype(str) == selected_period]
+        col_index += 1
+
+    if "Kelas" in filtered.columns:
+        kelas_options = ["Semua Kelas"] + sorted(filtered["Kelas"].dropna().astype(str).unique().tolist())
+        selected_kelas = filter_cols[col_index].selectbox("Kelas", kelas_options, key=f"{key_prefix}_kelas")
+        if selected_kelas != "Semua Kelas":
+            filtered = filtered[filtered["Kelas"].astype(str) == selected_kelas]
+        col_index += 1
+
+    student_options = (
+        filtered[["NIM", "Nama Mahasiswa"]]
+        .drop_duplicates()
+        .sort_values(["Nama Mahasiswa", "NIM"])
+        .reset_index(drop=True)
+    )
+    if student_options.empty:
+        st.info("Tidak ada mahasiswa pada filter yang dipilih.")
+        return
+    student_options["Label"] = student_options.apply(
+        lambda row: f"{row['NIM']} - {row.get('Nama Mahasiswa', '')}", axis=1
+    )
+    selected_label = filter_cols[min(col_index, len(filter_cols) - 1)].selectbox(
+        "NIM/Nama Mahasiswa", student_options["Label"].tolist(), key=f"{key_prefix}_mahasiswa"
+    )
+    selected_student = student_options[student_options["Label"] == selected_label].iloc[0]
+    student_rows = filtered[filtered["NIM"].astype(str) == str(selected_student["NIM"])]
+    detail = build_student_cpl_detail(student_rows, data["Master_CPL"])
+    detail["Nilai CPL Mahasiswa"] = pd.to_numeric(detail["Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
+    detail["Kriteria"] = detail["Nilai CPL Mahasiswa"].apply(classify_achievement)
+    detail["Status"] = detail["Nilai CPL Mahasiswa"].apply(
+        lambda value: "Mencapai" if value > CPL_STUDENT_ACHIEVEMENT_THRESHOLD else "Belum Mencapai"
+    )
+
+    identity = student_rows.iloc[0]
+    values = detail["Nilai CPL Mahasiswa"].round(2).tolist()
+    theta = detail["Kode CPL"].tolist()
+    avg_cpl = float(pd.Series(values).mean()) if values else 0.0
+    max_cpl = float(max(values)) if values else 0.0
+    min_cpl = float(min(values)) if values else 0.0
+    highest_row = detail.sort_values("Nilai CPL Mahasiswa", ascending=False).iloc[0]
+    lowest_row = detail.sort_values("Nilai CPL Mahasiswa", ascending=True).iloc[0]
+    achieved = int((detail["Nilai CPL Mahasiswa"] > CPL_STUDENT_ACHIEVEMENT_THRESHOLD).sum())
+    not_achieved = int(10 - achieved)
+
+    meta_parts = [
+        f"NIM: {identity.get('NIM', '-')}",
+        f"Nama: {identity.get('Nama Mahasiswa', '-')}",
+    ]
+    if "Kelas" in student_rows.columns:
+        meta_parts.append(f"Kelas: {identity.get('Kelas', '-')}")
+    if "Periode" in student_rows.columns:
+        meta_parts.append(f"Periode: {identity.get('Periode', selected_period or '-')}")
+    st.markdown("**Identitas Mahasiswa:** " + " | ".join(str(part) for part in meta_parts))
+
+    summary_cols = st.columns(5)
+    summary_cols[0].metric("Rata-rata CPL", f"{avg_cpl:.2f}")
+    summary_cols[1].metric("CPL Tertinggi", f"{highest_row['Kode CPL']} ({max_cpl:.1f})")
+    summary_cols[2].metric("CPL Terendah", f"{lowest_row['Kode CPL']} ({min_cpl:.1f})")
+    summary_cols[3].metric("CPL Mencapai", achieved)
+    summary_cols[4].metric("CPL Belum Mencapai", not_achieved)
+
+    closed_theta = theta + [theta[0]]
+    radar = go.Figure()
+    radar.add_trace(
+        go.Scatterpolar(
+            r=values + [values[0]],
+            theta=closed_theta,
+            fill="toself",
+            name="Nilai CPL Mahasiswa",
+            line=dict(color="#2563eb"),
+            opacity=0.65,
+        )
+    )
+    radar.add_trace(
+        go.Scatterpolar(
+            r=[CPL_STUDENT_ACHIEVEMENT_THRESHOLD] * len(closed_theta),
+            theta=closed_theta,
+            mode="lines",
+            name="Target Minimum 73",
+            line=dict(color="#ef4444", dash="dash"),
+        )
+    )
+    radar.add_trace(
+        go.Scatterpolar(
+            r=[avg_cpl] * len(closed_theta),
+            theta=closed_theta,
+            mode="lines",
+            name="Rata-rata CPL",
+            line=dict(color="#f97316"),
+        )
+    )
+    radar.add_trace(
+        go.Scatterpolar(
+            r=[max_cpl] * len(closed_theta),
+            theta=closed_theta,
+            mode="lines",
+            name="CPL Tertinggi",
+            line=dict(color="#16a34a"),
+        )
+    )
+    radar.add_trace(
+        go.Scatterpolar(
+            r=[min_cpl] * len(closed_theta),
+            theta=closed_theta,
+            mode="lines",
+            name="CPL Terendah",
+            line=dict(color="#6b7280"),
+        )
+    )
+    radar.update_layout(
+        title="Radar CPL Per Mahasiswa",
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        showlegend=True,
+    )
+    st.plotly_chart(radar, width="stretch")
+
+    table = detail[["Kode CPL", "Rumusan CPL", "Nilai CPL Mahasiswa", "Kriteria", "Status"]].copy()
+    st.dataframe(format_display(table), width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":

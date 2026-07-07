@@ -2421,6 +2421,7 @@ def render_download_buttons_single(
             "Semua_Rekap_Asesmen_CPL.xlsx",
             {
                 "Rekap_CPMK": rekap_cpmk,
+                "Tren_CPMK": prepare_trend_cpmk(rekap_cpmk),
                 "Rekap_IK": rekap_ik,
                 "Rekap_CPL": rekap_cpl,
                 "Laporan_CQI": cqi,
@@ -2459,6 +2460,7 @@ def render_download_buttons_multi(
             "Semua_Rekap_Multi_Semester.xlsx",
             {
                 "Rekap_CPMK_All": rekap_cpmk_all,
+                "Tren_CPMK": prepare_trend_cpmk(rekap_cpmk_all),
                 "Rekap_IK_All": rekap_ik_all,
                 "Rekap_CPL_All": rekap_cpl_all,
                 "Tren_CPL": trend_cpl,
@@ -2844,6 +2846,7 @@ def render_single_mode() -> None:
         "Rekap IK",
         "Rekap CPL",
         "Tren CPL",
+        "Tren CPMK",
         "Tren IK",
     ]
     if "Nilai_Asesmen_Detail" in filtered_data:
@@ -2870,8 +2873,10 @@ def render_single_mode() -> None:
     with tabs[4]:
         render_trend_cpl(rekap_cpmk)
     with tabs[5]:
+        render_trend_cpmk(rekap_cpmk)
+    with tabs[6]:
         render_trend_ik(rekap_cpmk)
-    next_index = 6
+    next_index = 7
     if "Nilai_Asesmen_Detail" in filtered_data:
         with tabs[next_index]:
             render_detail_asesmen(prepare_data(filtered_data)["Nilai_Asesmen_Detail"])
@@ -3062,6 +3067,7 @@ def render_multi_mode() -> None:
         "Rekap IK",
         "Rekap CPL",
         "Tren CPL",
+        "Tren CPMK",
         "Tren IK",
     ]
     if not detail_asesmen_all.empty:
@@ -3094,8 +3100,10 @@ def render_multi_mode() -> None:
     with tabs[4]:
         render_trend_cpl(rekap_cpmk_all)
     with tabs[5]:
+        render_trend_cpmk(rekap_cpmk_all)
+    with tabs[6]:
         render_trend_ik(rekap_cpmk_all)
-    next_index = 6
+    next_index = 7
     if not detail_asesmen_all.empty:
         with tabs[next_index]:
             render_detail_asesmen(detail_asesmen_all)
@@ -3537,6 +3545,15 @@ def sort_ik_key(value):
     return tuple(numeric + [0] * (3 - len(numeric)))
 
 
+def cpmk_sort_key(code):
+    match = re.match(r"CPMK(\d+)(?:\.(\d+))?", str(code).strip().upper())
+    if not match:
+        return (999, 999)
+    major = int(match.group(1))
+    minor = int(match.group(2)) if match.group(2) else 0
+    return (major, minor)
+
+
 def _final_cpl_master(master_cpl: pd.DataFrame) -> pd.DataFrame:
     base = pd.DataFrame({"Kode CPL": CPL_RADAR_CODES})
     if master_cpl is None or master_cpl.empty:
@@ -3917,6 +3934,190 @@ def make_trend_ik(rekap_ik_all: pd.DataFrame) -> pd.DataFrame:
         if column not in frame.columns:
             frame[column] = 0 if column.startswith("Jumlah") else ""
     return frame[output_columns].sort_values(["Periode", "Kode CPL", "Kode IK"]).reset_index(drop=True)
+
+
+def prepare_trend_cpmk(rekap_cpmk: pd.DataFrame) -> pd.DataFrame:
+    output_columns = [
+        "Kode CPMK",
+        "Kode CPL",
+        "Kode IK",
+        "Capaian CPMK",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Tercapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+    ]
+    if rekap_cpmk is None or rekap_cpmk.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    df = filter_valid_codes(
+        rekap_cpmk.copy(),
+        require_cpl="Kode CPL" in rekap_cpmk.columns,
+        require_ik="Kode IK" in rekap_cpmk.columns,
+        require_cpmk=True,
+    )
+    if df.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    value_col = pick_existing_column(df, ["Capaian CPMK", "Rata-rata Nilai"])
+    if value_col is None:
+        return pd.DataFrame(columns=output_columns)
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0).clip(0, 100)
+
+    weight_col = pick_existing_column(df, ["Bobot_CPMK_Bersih", "Bobot CPMK"])
+    if weight_col:
+        df["_Bobot_CPMK_Agregat"] = clean_weight_series(df[weight_col])
+    else:
+        df["_Bobot_CPMK_Agregat"] = 1.0
+    df["_Bobot_CPMK_Agregat"] = pd.to_numeric(df["_Bobot_CPMK_Agregat"], errors="coerce").fillna(1)
+    df["_Bobot_CPMK_Agregat"] = df["_Bobot_CPMK_Agregat"].where(df["_Bobot_CPMK_Agregat"] > 0, 1)
+
+    if "Jumlah Mahasiswa Tercapai" not in df.columns and "Jumlah Mahasiswa Mencapai" in df.columns:
+        df["Jumlah Mahasiswa Tercapai"] = df["Jumlah Mahasiswa Mencapai"]
+    if "Persentase Ketercapaian (%)" not in df.columns:
+        percent_col = pick_existing_column(df, ["Persentase CPMK", "Persentase Ketercapaian"])
+        df["Persentase Ketercapaian (%)"] = (
+            pd.to_numeric(df[percent_col], errors="coerce") if percent_col else 0
+        )
+
+    rows = []
+    optional_label_cols = [col for col in ["Periode", "Tahun Akademik", "Semester"] if col in df.columns]
+    group_cols = optional_label_cols + ["Kode CPMK"]
+    for group_keys, group in df.groupby(group_cols, dropna=False):
+        if not isinstance(group_keys, tuple):
+            group_keys = (group_keys,)
+        row = dict(zip(group_cols, group_keys))
+        scores = pd.to_numeric(group[value_col], errors="coerce").fillna(0).clip(0, 100)
+        weights = pd.to_numeric(group["_Bobot_CPMK_Agregat"], errors="coerce").fillna(1)
+        weights = weights.where(weights > 0, 1)
+        capaian = float((scores * weights).sum() / weights.sum()) if weights.sum() > 0 else float(scores.mean())
+        jumlah_series = (
+            pd.to_numeric(group["Jumlah Mahasiswa"], errors="coerce").fillna(0)
+            if "Jumlah Mahasiswa" in group.columns
+            else pd.Series([0], index=[0])
+        )
+        tercapai_series = (
+            pd.to_numeric(group["Jumlah Mahasiswa Tercapai"], errors="coerce").fillna(0)
+            if "Jumlah Mahasiswa Tercapai" in group.columns
+            else pd.Series([0], index=[0])
+        )
+        jumlah = jumlah_series.sum()
+        tercapai = tercapai_series.sum()
+        percent = (tercapai / jumlah * 100) if jumlah > 0 else 0.0
+        row.update(
+            {
+                "Kode CPL": ", ".join(sorted(group.get("Kode CPL", pd.Series(dtype=str)).dropna().astype(str).unique(), key=sort_cpl_key)),
+                "Kode IK": ", ".join(sorted(group.get("Kode IK", pd.Series(dtype=str)).dropna().astype(str).unique(), key=sort_ik_key)),
+                "Capaian CPMK": max(0.0, min(100.0, capaian)),
+                "Jumlah Mahasiswa": int(jumlah),
+                "Jumlah Mahasiswa Tercapai": int(tercapai),
+                "Persentase Ketercapaian (%)": max(0.0, min(100.0, percent)),
+            }
+        )
+        row["Kriteria"] = classify_achievement(row["Capaian CPMK"])
+        row["Status"] = classify_status_by_score(row["Capaian CPMK"])
+        rows.append(row)
+
+    trend = pd.DataFrame(rows)
+    if trend.empty:
+        return pd.DataFrame(columns=output_columns)
+    trend["_sort_cpmk"] = trend["Kode CPMK"].map(cpmk_sort_key)
+    trend = trend.sort_values(optional_label_cols + ["_sort_cpmk"]).drop(columns=["_sort_cpmk"])
+    for column in output_columns:
+        if column not in trend.columns:
+            trend[column] = ""
+    return trend
+
+
+def render_trend_cpmk(rekap_cpmk: pd.DataFrame) -> None:
+    trend = prepare_trend_cpmk(rekap_cpmk)
+    if trend.empty:
+        st.info("Belum ada data CPMK valid untuk ditampilkan.")
+        return
+
+    filters = st.columns(3)
+    filtered = trend.copy()
+    if "Periode" in filtered.columns and filtered["Periode"].astype(str).str.strip().ne("").any():
+        options = ["Semua Periode"] + sorted(filtered["Periode"].dropna().astype(str).unique().tolist())
+        selected = filters[0].selectbox("Periode", options, key="trend_cpmk_periode")
+        if selected != "Semua Periode":
+            filtered = filtered[filtered["Periode"].astype(str) == selected]
+    if "Semester" in filtered.columns and filtered["Semester"].astype(str).str.strip().ne("").any():
+        options = ["Semua Semester"] + sorted(filtered["Semester"].dropna().astype(str).unique().tolist())
+        selected = filters[1].selectbox("Semester", options, key="trend_cpmk_semester")
+        if selected != "Semua Semester":
+            filtered = filtered[filtered["Semester"].astype(str) == selected]
+    if "Kode CPL" in filtered.columns and filtered["Kode CPL"].astype(str).str.strip().ne("").any():
+        cpl_values = sorted(
+            set(
+                item.strip()
+                for value in filtered["Kode CPL"].dropna().astype(str)
+                for item in value.split(",")
+                if item.strip()
+            ),
+            key=sort_cpl_key,
+        )
+        options = ["Semua CPL"] + cpl_values
+        selected = filters[2].selectbox("Kode CPL", options, key="trend_cpmk_cpl")
+        if selected != "Semua CPL":
+            filtered = filtered[filtered["Kode CPL"].astype(str).str.contains(rf"(^|,\s*){re.escape(selected)}(,|$)", regex=True)]
+
+    if filtered.empty:
+        st.info("Tidak ada CPMK pada filter yang dipilih.")
+        return
+
+    status_counts = filtered["Status"].value_counts()
+    average_score = float(pd.to_numeric(filtered["Capaian CPMK"], errors="coerce").fillna(0).mean())
+    highest = filtered.sort_values("Capaian CPMK", ascending=False).iloc[0]
+    lowest = filtered.sort_values("Capaian CPMK", ascending=True).iloc[0]
+    cards = st.columns(7)
+    cards[0].metric("Jumlah CPMK", len(filtered))
+    cards[1].metric("Rata-rata Capaian CPMK", f"{average_score:.2f}")
+    cards[2].metric("CPMK Melampaui", int(status_counts.get("Melampaui", 0)))
+    cards[3].metric("CPMK Memenuhi Target", int(status_counts.get("Memenuhi Target", 0)))
+    cards[4].metric("CPMK Perlu Perhatian", int(status_counts.get("Perlu Perhatian", 0)))
+    cards[5].metric("CPMK Tertinggi", f"{highest['Kode CPMK']} ({highest['Capaian CPMK']:.1f})")
+    cards[6].metric("CPMK Terendah", f"{lowest['Kode CPMK']} ({lowest['Capaian CPMK']:.1f})")
+
+    st.subheader("Tren Capaian CPMK")
+    filtered = filtered.copy()
+    filtered["_sort_cpmk"] = filtered["Kode CPMK"].map(cpmk_sort_key)
+    filtered = filtered.sort_values("_sort_cpmk").drop(columns=["_sort_cpmk"])
+    fig = px.bar(
+        filtered,
+        x="Kode CPMK",
+        y="Capaian CPMK",
+        color="Kriteria",
+        text=filtered["Capaian CPMK"].round(1),
+        color_discrete_map=ACHIEVEMENT_COLORS,
+        category_orders={"Kriteria": ["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]},
+        title="Tren Capaian CPMK",
+    )
+    fig.add_hline(
+        y=CPL_STUDENT_ACHIEVEMENT_THRESHOLD,
+        line_dash="dash",
+        line_color="#ef4444",
+        annotation_text="Target Minimum 73",
+        annotation_position="top left",
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_layout(height=560, xaxis_tickangle=-45)
+    fig.update_yaxes(range=[0, 105], title="Capaian CPMK")
+    st.plotly_chart(fig, width="stretch")
+
+    table_columns = [
+        "Kode CPMK",
+        "Kode CPL",
+        "Kode IK",
+        "Capaian CPMK",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Tercapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+    ]
+    st.dataframe(format_display(filtered[table_columns]), width="stretch", hide_index=True)
 
 
 def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:

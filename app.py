@@ -3435,6 +3435,60 @@ def get_numeric_from_row(row, col, default=0.0, clamp=True):
         return default
 
 
+def clean_code_column(df, col):
+    if col not in df.columns:
+        return df
+    df = df.copy()
+    df[col] = df[col].astype(str).str.strip()
+    df[col] = df[col].replace(
+        {
+            "": pd.NA,
+            "nan": pd.NA,
+            "NaN": pd.NA,
+            "None": pd.NA,
+            "-": pd.NA,
+        }
+    )
+    return df
+
+
+def filter_valid_codes(df, require_cpl=False, require_ik=False, require_cpmk=False):
+    df = df.copy()
+
+    if "Kode CPL" in df.columns:
+        df = clean_code_column(df, "Kode CPL")
+        df["Kode CPL"] = df["Kode CPL"].map(canonical_cpl_radar_code)
+        if require_cpl:
+            df = df[df["Kode CPL"].notna()]
+            df = df[df["Kode CPL"].str.match(r"^CPL\d{2}$", na=False)]
+
+    if "Kode IK" in df.columns:
+        df = clean_code_column(df, "Kode IK")
+        if require_ik:
+            df = df[df["Kode IK"].notna()]
+            df = df[df["Kode IK"].str.match(r"^IK\d+(\.\d+)?$", na=False)]
+
+    if "Kode CPMK" in df.columns:
+        df = clean_code_column(df, "Kode CPMK")
+        if require_cpmk:
+            df = df[df["Kode CPMK"].notna()]
+            df = df[df["Kode CPMK"].str.match(r"^CPMK\d+(\.\d+)?$", na=False)]
+
+    return df
+
+
+def sort_ik_key(value):
+    text = str(value).strip().upper().replace("IK", "")
+    parts = text.split(".")
+    numeric = []
+    for part in parts:
+        try:
+            numeric.append(int(part))
+        except ValueError:
+            numeric.append(999)
+    return tuple(numeric + [0] * (3 - len(numeric)))
+
+
 def _final_cpl_master(master_cpl: pd.DataFrame) -> pd.DataFrame:
     base = pd.DataFrame({"Kode CPL": CPL_RADAR_CODES})
     if master_cpl is None or master_cpl.empty:
@@ -3460,6 +3514,7 @@ def calculate_rekap_ik_from_students(nilai_df, mapping_df, master_ik, target_ket
         if column not in master.columns:
             master[column] = ""
     master["Kode CPL"] = master["Kode CPL"].map(canonical_cpl_radar_code)
+    master = filter_valid_codes(master, require_cpl=True, require_ik=True)
     master = master[["Kode CPL", "Kode IK", "Notasi IK", "Rumusan IK"]].drop_duplicates(
         ["Kode CPL", "Kode IK"]
     )
@@ -3473,29 +3528,37 @@ def calculate_rekap_ik_from_students(nilai_df, mapping_df, master_ik, target_ket
     else:
         working = student_ik.copy()
         working["Kode CPL"] = working["Kode CPL"].map(canonical_cpl_radar_code)
-        working["Nilai IK"] = pd.to_numeric(working["Nilai IK"], errors="coerce").fillna(0).clip(0, 100)
-        summary = (
-            working.groupby(["Kode CPL", "Kode IK"], dropna=False)
-            .agg(
-                **{
-                    "Capaian IK": ("Nilai IK", "mean"),
-                    "Jumlah Mahasiswa": ("NIM", "nunique"),
-                    "Jumlah Mahasiswa Mencapai": (
-                        "Nilai IK",
-                        lambda values: int(
-                            (pd.to_numeric(values, errors="coerce") > CPL_STUDENT_ACHIEVEMENT_THRESHOLD).sum()
+        working = filter_valid_codes(working, require_cpl=True, require_ik=True)
+        if working.empty:
+            rekap = master.copy()
+            rekap["Capaian IK"] = 0.0
+            rekap["Jumlah Mahasiswa"] = 0
+            rekap["Jumlah Mahasiswa Mencapai"] = 0
+            rekap["Persentase Ketercapaian (%)"] = 0.0
+        else:
+            working["Nilai IK"] = pd.to_numeric(working["Nilai IK"], errors="coerce").fillna(0).clip(0, 100)
+            summary = (
+                working.groupby(["Kode CPL", "Kode IK"], dropna=False)
+                .agg(
+                    **{
+                        "Capaian IK": ("Nilai IK", "mean"),
+                        "Jumlah Mahasiswa": ("NIM", "nunique"),
+                        "Jumlah Mahasiswa Mencapai": (
+                            "Nilai IK",
+                            lambda values: int(
+                                (pd.to_numeric(values, errors="coerce") > CPL_STUDENT_ACHIEVEMENT_THRESHOLD).sum()
+                            ),
                         ),
-                    ),
-                }
+                    }
+                )
+                .reset_index()
             )
-            .reset_index()
-        )
-        summary["Persentase Ketercapaian (%)"] = (
-            summary["Jumlah Mahasiswa Mencapai"]
-            / summary["Jumlah Mahasiswa"].replace(0, pd.NA)
-            * 100
-        ).fillna(0)
-        rekap = master.merge(summary, on=["Kode CPL", "Kode IK"], how="left")
+            summary["Persentase Ketercapaian (%)"] = (
+                summary["Jumlah Mahasiswa Mencapai"]
+                / summary["Jumlah Mahasiswa"].replace(0, pd.NA)
+                * 100
+            ).fillna(0)
+            rekap = master.merge(summary, on=["Kode CPL", "Kode IK"], how="left")
 
     for column in ["Capaian IK", "Persentase Ketercapaian (%)"]:
         rekap[column] = pd.to_numeric(rekap[column], errors="coerce").fillna(0).clip(0, 100)
@@ -3540,6 +3603,7 @@ def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=No
         if not student_cpl.empty:
             student_cpl = student_cpl.copy()
             student_cpl["Kode CPL"] = student_cpl["Kode CPL Radar"].map(canonical_cpl_radar_code)
+            student_cpl = filter_valid_codes(student_cpl, require_cpl=True)
             student_cpl["Nilai CPL"] = pd.to_numeric(student_cpl["Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
             summary = (
                 student_cpl.groupby("Kode CPL", dropna=False)
@@ -3574,6 +3638,7 @@ def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=No
     elif rekap_ik is not None and not rekap_ik.empty:
         ik = rekap_ik.copy()
         ik["Kode CPL"] = ik["Kode CPL"].map(canonical_cpl_radar_code)
+        ik = filter_valid_codes(ik, require_cpl=True)
         percent_col = _final_percent_column(ik) or "Capaian IK"
         ik["Capaian IK"] = _final_numeric_series(ik, "Capaian IK").clip(0, 100)
         ik[percent_col] = pd.to_numeric(ik[percent_col], errors="coerce").fillna(0).clip(0, 100)
@@ -3884,7 +3949,10 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
                 "Periode", period_options, index=len(period_options) - 1, key="trend_cpl_period_final"
             )
             df = df[df["Periode"].astype(str) == selected_period].copy()
-    df["Kode CPL"] = df["Kode CPL"].map(canonical_cpl_radar_code)
+    df = filter_valid_codes(df, require_cpl=True, require_cpmk=True)
+    if df.empty:
+        st.info("Tidak ada data CPMK dengan Kode CPL dan Kode CPMK valid untuk Tren CPL.")
+        return
     value_col = pick_existing_column(
         df,
         [
@@ -3901,9 +3969,14 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
     if "Kriteria" not in df.columns:
         df["Kriteria"] = df[value_col].apply(classify_achievement)
     df["Kriteria"] = df["Kriteria"].fillna(df[value_col].apply(classify_achievement))
+    df["Kriteria"] = df["Kriteria"].where(
+        df["Kriteria"].isin(["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]),
+        df[value_col].apply(classify_achievement),
+    )
     cpmk_col = "Kode CPMK" if "Kode CPMK" in df.columns else None
     if cpmk_col:
         df = df.drop_duplicates(["Kode CPL", cpmk_col])
+    df = df.sort_values("Kode CPL")
 
     category_order = ["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]
     counts = df["Kriteria"].value_counts()
@@ -3948,6 +4021,7 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
         if category not in pivot.columns:
             pivot[category] = 0
     pivot["Total CPMK"] = pivot[category_order].sum(axis=1)
+    pivot = pivot.sort_values("Kode CPL")
     st.dataframe(format_display(pivot[["Kode CPL", "Total CPMK"] + category_order]), width="stretch", hide_index=True)
 
 
@@ -3966,8 +4040,11 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
                 "Periode", period_options, index=len(period_options) - 1, key="trend_ik_period_final"
             )
             df = df[df["Periode"].astype(str) == selected_period].copy()
-    df["Kode CPL"] = df["Kode CPL"].map(canonical_cpl_radar_code)
-    cpl_options = sorted(df["Kode CPL"].dropna().unique().tolist())
+    df = filter_valid_codes(df, require_cpl=True, require_ik=True, require_cpmk=True)
+    if df.empty:
+        st.info("Tidak ada data CPMK dengan Kode CPL, Kode IK, dan Kode CPMK valid untuk Tren IK.")
+        return
+    cpl_options = sorted(df["Kode CPL"].dropna().unique().tolist(), key=sort_cpl_key)
     selected_cpl = st.selectbox("Pilih Kode CPL", cpl_options, key="trend_ik_cpl_final")
     filtered = df[df["Kode CPL"] == selected_cpl].copy()
     value_col = pick_existing_column(
@@ -3987,9 +4064,14 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
     if "Kriteria" not in filtered.columns:
         filtered["Kriteria"] = filtered[value_col].apply(classify_achievement)
     filtered["Kriteria"] = filtered["Kriteria"].fillna(filtered[value_col].apply(classify_achievement))
+    filtered["Kriteria"] = filtered["Kriteria"].where(
+        filtered["Kriteria"].isin(["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]),
+        filtered[value_col].apply(classify_achievement),
+    )
     cpmk_col = "Kode CPMK" if "Kode CPMK" in filtered.columns else None
     if cpmk_col:
         filtered = filtered.drop_duplicates(["Kode CPL", "Kode IK", cpmk_col])
+    filtered = filtered.sort_values("Kode IK", key=lambda values: values.map(sort_ik_key))
 
     category_order = ["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]
     grouped = (
@@ -4000,10 +4082,11 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
     totals = grouped.groupby("Kode IK")["Jumlah CPMK"].transform("sum").replace(0, pd.NA)
     grouped["Persentase Komposisi CPMK (%)"] = (grouped["Jumlah CPMK"] / totals * 100).fillna(0).clip(0, 100)
     grouped["Kriteria"] = pd.Categorical(grouped["Kriteria"], categories=category_order, ordered=True)
-    grouped = grouped.sort_values(["Kode IK", "Kriteria"])
+    grouped["_sort_ik"] = grouped["Kode IK"].map(sort_ik_key)
+    grouped = grouped.sort_values(["_sort_ik", "Kriteria"])
 
     fig = px.bar(
-        grouped,
+        grouped.drop(columns=["_sort_ik"]),
         x="Kode IK",
         y="Persentase Komposisi CPMK (%)",
         color="Kriteria",
@@ -4029,6 +4112,8 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
         if category not in pivot.columns:
             pivot[category] = 0
     pivot["Total CPMK"] = pivot[category_order].sum(axis=1)
+    pivot["_sort_ik"] = pivot["Kode IK"].map(sort_ik_key)
+    pivot = pivot.sort_values("_sort_ik").drop(columns=["_sort_ik"])
     st.dataframe(format_display(pivot[["Kode IK", "Total CPMK"] + category_order]), width="stretch", hide_index=True)
 
 

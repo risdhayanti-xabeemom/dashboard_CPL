@@ -2460,7 +2460,9 @@ def render_download_buttons_multi(
             "Semua_Rekap_Multi_Semester.xlsx",
             {
                 "Rekap_CPMK_All": rekap_cpmk_all,
-                "Tren_CPMK": prepare_trend_cpmk(rekap_cpmk_all),
+                "Rekap_CPMK_Gabungan": aggregate_rekap_cpmk_multi(rekap_cpmk_all),
+                "Tren_CPMK": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk_all)),
+                "Tren_CPMK_Per_Periode": prepare_trend_cpmk(rekap_cpmk_all),
                 "Rekap_IK_All": rekap_ik_all,
                 "Rekap_CPL_All": rekap_cpl_all,
                 "Tren_CPL": trend_cpl,
@@ -3046,6 +3048,17 @@ def render_multi_mode() -> None:
     if not detail_asesmen_all.empty:
         detail_asesmen_all = filter_frame(detail_asesmen_all, multi_filters, "Komponen")
 
+    selected_period_count = (
+        rekap_cpmk_all["Periode"].dropna().astype(str).nunique()
+        if "Periode" in rekap_cpmk_all.columns
+        else 0
+    )
+    rekap_cpmk_view = (
+        rekap_cpmk_all.copy()
+        if selected_period_count == 1
+        else aggregate_rekap_cpmk_multi(rekap_cpmk_all)
+    )
+
     trend_cpl = make_trend_cpl(rekap_cpl_all)
     trend_ik = make_trend_ik(rekap_ik_all)
     cqi_all = add_cqi_tracking(cqi_all_raw, rekap_cpl_all, period_order)
@@ -3092,17 +3105,21 @@ def render_multi_mode() -> None:
         else:
             st.info("Belum ada data mahasiswa yang dapat ditampilkan sebagai Radar CPL.")
     with tabs[1]:
-        st.dataframe(format_display(rekap_cpmk_all), use_container_width=True, hide_index=True)
+        if selected_period_count == 1:
+            st.caption("Rekap CPMK periode terpilih.")
+        else:
+            st.caption("Rekap CPMK gabungan semua periode.")
+        st.dataframe(format_display(rekap_cpmk_view), use_container_width=True, hide_index=True)
     with tabs[2]:
         st.dataframe(format_display(rekap_ik_all), use_container_width=True, hide_index=True)
     with tabs[3]:
         st.dataframe(format_display(rekap_cpl_all), use_container_width=True, hide_index=True)
     with tabs[4]:
-        render_trend_cpl(rekap_cpmk_all)
+        render_trend_cpl(rekap_cpmk_view)
     with tabs[5]:
-        render_trend_cpmk(rekap_cpmk_all)
+        render_trend_cpmk(rekap_cpmk_view)
     with tabs[6]:
-        render_trend_ik(rekap_cpmk_all)
+        render_trend_ik(rekap_cpmk_view)
     next_index = 7
     if not detail_asesmen_all.empty:
         with tabs[next_index]:
@@ -4030,6 +4047,69 @@ def prepare_trend_cpmk(rekap_cpmk: pd.DataFrame) -> pd.DataFrame:
     return trend
 
 
+def aggregate_rekap_cpmk_multi(rekap_cpmk: pd.DataFrame) -> pd.DataFrame:
+    if rekap_cpmk is None or rekap_cpmk.empty:
+        return pd.DataFrame()
+    df = filter_valid_codes(
+        rekap_cpmk.copy(),
+        require_cpl="Kode CPL" in rekap_cpmk.columns,
+        require_ik="Kode IK" in rekap_cpmk.columns,
+        require_cpmk=True,
+    )
+    if df.empty:
+        return df
+
+    value_col = pick_existing_column(df, ["Capaian CPMK", "Rata-rata Nilai"])
+    if value_col is None:
+        return df.iloc[0:0].copy()
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0).clip(0, 100)
+    if "Jumlah Mahasiswa Tercapai" not in df.columns and "Jumlah Mahasiswa Mencapai" in df.columns:
+        df["Jumlah Mahasiswa Tercapai"] = df["Jumlah Mahasiswa Mencapai"]
+    for column in ["Jumlah Mahasiswa", "Jumlah Mahasiswa Tercapai"]:
+        if column not in df.columns:
+            df[column] = 0
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+
+    group_cols = [col for col in ["Kode CPMK", "Kode CPL", "Kode IK"] if col in df.columns]
+    rows = []
+    for keys, group in df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = dict(zip(group_cols, keys))
+        weights = pd.to_numeric(group["Jumlah Mahasiswa"], errors="coerce").fillna(0)
+        scores = pd.to_numeric(group[value_col], errors="coerce").fillna(0).clip(0, 100)
+        if weights.sum() > 0:
+            capaian = float((scores * weights).sum() / weights.sum())
+        else:
+            capaian = float(scores.mean()) if len(scores) else 0.0
+        jumlah = int(weights.sum())
+        tercapai = int(pd.to_numeric(group["Jumlah Mahasiswa Tercapai"], errors="coerce").fillna(0).sum())
+        percent = (tercapai / jumlah * 100) if jumlah > 0 else 0.0
+        row.update(
+            {
+                "Mata Kuliah": "Gabungan Multi Semester",
+                "Rumusan CPMK": group.get("Rumusan CPMK", pd.Series([""])).dropna().astype(str).iloc[0]
+                if "Rumusan CPMK" in group.columns and not group["Rumusan CPMK"].dropna().empty
+                else "",
+                "Jumlah Mahasiswa": jumlah,
+                "Jumlah Mahasiswa Tercapai": tercapai,
+                "Rata-rata Nilai": max(0.0, min(100.0, capaian)),
+                "Capaian CPMK": max(0.0, min(100.0, capaian)),
+                "Persentase CPMK": max(0.0, min(100.0, percent)),
+                "Persentase Ketercapaian (%)": max(0.0, min(100.0, percent)),
+            }
+        )
+        row["Kriteria"] = classify_achievement(row["Capaian CPMK"])
+        row["Status"] = classify_status_by_score(row["Capaian CPMK"])
+        rows.append(row)
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    result["_sort_cpmk"] = result["Kode CPMK"].map(cpmk_sort_key)
+    return result.sort_values([col for col in ["Kode CPL", "Kode IK"] if col in result.columns] + ["_sort_cpmk"]).drop(columns=["_sort_cpmk"]).reset_index(drop=True)
+
+
 def render_trend_cpmk(rekap_cpmk: pd.DataFrame) -> None:
     trend = prepare_trend_cpmk(rekap_cpmk)
     if trend.empty:
@@ -4168,6 +4248,38 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
     chart.update_traces(textposition="outside", cliponaxis=False)
     chart.update_yaxes(range=[0, 105])
     st.plotly_chart(chart, width="stretch")
+
+    labels = cpl["Kode CPL"].tolist()
+    values = cpl["Rata-rata Nilai CPL"].round(2).tolist()
+    if labels:
+        closed_labels = labels + [labels[0]]
+        closed_values = values + [values[0]]
+        radar = go.Figure()
+        radar.add_trace(
+            go.Scatterpolar(
+                r=closed_values,
+                theta=closed_labels,
+                fill="toself",
+                name="Rata-rata Capaian CPL",
+                line=dict(color="#2563eb"),
+                opacity=0.65,
+            )
+        )
+        radar.add_trace(
+            go.Scatterpolar(
+                r=[CPL_STUDENT_ACHIEVEMENT_THRESHOLD] * len(closed_labels),
+                theta=closed_labels,
+                mode="lines",
+                name="Target Minimum 73",
+                line=dict(color="#ef4444", dash="dash"),
+            )
+        )
+        radar.update_layout(
+            title="Radar CPL Keseluruhan",
+            polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+            showlegend=True,
+        )
+        st.plotly_chart(radar, width="stretch")
 
 
 def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:

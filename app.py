@@ -504,9 +504,36 @@ def normalize_component(value: object) -> str:
     return COMPONENT_ALIASES.get(text.lower(), text)
 
 
+def make_unique_columns(columns):
+    seen = {}
+    new_cols = []
+    for col in columns:
+        base = str(col).strip()
+        if base in seen:
+            seen[base] += 1
+            new_cols.append(f"{base}_{seen[base]}")
+        else:
+            seen[base] = 0
+            new_cols.append(base)
+    return new_cols
+
+
+def get_series_safe(df: pd.DataFrame, col):
+    if col is None or df is None:
+        return None
+    if col not in df.columns:
+        return None
+    data = df[col]
+    if isinstance(data, pd.DataFrame):
+        if data.shape[1] == 0:
+            return None
+        data = data.iloc[:, 0]
+    return data
+
+
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = df.copy()
-    cleaned.columns = [canonical_column_name(col) for col in cleaned.columns]
+    cleaned.columns = make_unique_columns([canonical_column_name(col) for col in cleaned.columns])
     return cleaned.dropna(how="all")
 
 
@@ -3057,7 +3084,12 @@ def render_single_mode() -> None:
             step=1.0,
         )
         st.divider()
-        raw_data_global, global_filters = render_global_filters(raw_data, "single_global")
+        try:
+            raw_data_global, global_filters = render_global_filters(raw_data, "single_global")
+        except Exception as exc:
+            st.sidebar.warning(f"Filter global belum dapat diterapkan: {exc}")
+            raw_data_global = raw_data
+            global_filters = {}
         st.divider()
         filters = render_filter_controls(raw_data_global, "single")
         st.divider()
@@ -3232,9 +3264,14 @@ def render_multi_mode() -> None:
         return
 
     combined_nilai_cpmk = pd.concat(nilai_frames, ignore_index=True)
-    global_filter_data, global_filters = render_global_filters(
-        {"Nilai_CPMK": combined_nilai_cpmk}, "multi_global"
-    )
+    try:
+        global_filter_data, global_filters = render_global_filters(
+            {"Nilai_CPMK": combined_nilai_cpmk}, "multi_global"
+        )
+    except Exception as exc:
+        st.sidebar.warning(f"Filter global belum dapat diterapkan: {exc}")
+        global_filter_data = {"Nilai_CPMK": combined_nilai_cpmk}
+        global_filters = {}
     combined_nilai_cpmk = global_filter_data["Nilai_CPMK"]
     for periode in period_labels:
         period_nilai = combined_nilai_cpmk[
@@ -3841,12 +3878,15 @@ def natural_sort_key(value: object):
 
 
 def find_column_by_alias(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
-    normalized_cols = {
-        str(col).strip().lower().replace("_", " "): col
-        for col in df.columns
-    }
+    if df is None or df.empty:
+        return None
+    normalized_cols = {}
+    for col in df.columns:
+        key = str(col).strip().lower().replace("_", " ")
+        if key not in normalized_cols:
+            normalized_cols[key] = col
     for alias in aliases:
-        key = alias.strip().lower().replace("_", " ")
+        key = str(alias).strip().lower().replace("_", " ")
         if key in normalized_cols:
             return normalized_cols[key]
     return None
@@ -3924,21 +3964,16 @@ def render_global_filters(raw_data: Dict[str, pd.DataFrame], key_prefix: str = "
 
     def sidebar_filter(label: str, col: Optional[str]) -> str:
         nonlocal df
-        if col is None or col not in df.columns:
+        series = get_series_safe(df, col)
+        if series is None:
             st.sidebar.caption(f"Kolom {label} belum tersedia pada Nilai_CPMK")
             active_filters[label] = "Semua"
             return "Semua"
 
-        values = (
-            df[col]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .replace("", pd.NA)
-            .dropna()
-            .unique()
-            .tolist()
-        )
+        series = series.dropna().astype(str).str.strip()
+        series = series[series != ""]
+        series = series[~series.str.lower().isin(["nan", "none", "-"])]
+        values = series.dropna().unique().tolist()
         if label == "Semester Kurikulum":
             values = sorted({semester_kurikulum_label(value) for value in values}, key=natural_sort_key)
         else:
@@ -3947,10 +3982,15 @@ def render_global_filters(raw_data: Dict[str, pd.DataFrame], key_prefix: str = "
         selected = st.sidebar.selectbox(label, options, key=f"{key_prefix}_filter_{label.replace(' ', '_').lower()}")
 
         if selected != "Semua":
+            series_filter = get_series_safe(df, col)
+            if series_filter is None:
+                active_filters[label] = "Semua"
+                return "Semua"
             if label == "Semester Kurikulum":
-                df = df[semester_kurikulum_matches(df[col], [selected])]
+                df = df[semester_kurikulum_matches(series_filter, [selected])]
             else:
-                df = df[df[col].astype(str).str.strip() == selected]
+                mask = series_filter.astype(str).str.strip() == selected
+                df = df[mask]
 
         active_filters[label] = selected
         return selected
@@ -3964,11 +4004,12 @@ def render_global_filters(raw_data: Dict[str, pd.DataFrame], key_prefix: str = "
         for label, aliases in GLOBAL_FILTER_ALIASES.items():
             selected = active_filters.get(label, "Semua")
             col = find_column_by_alias(detail, aliases)
-            if selected != "Semua" and col in detail.columns:
+            series_filter = get_series_safe(detail, col)
+            if selected != "Semua" and series_filter is not None:
                 if label == "Semester Kurikulum":
-                    detail = detail[semester_kurikulum_matches(detail[col], [selected])]
+                    detail = detail[semester_kurikulum_matches(series_filter, [selected])]
                 else:
-                    detail = detail[detail[col].astype(str).str.strip() == selected]
+                    detail = detail[series_filter.astype(str).str.strip() == selected]
         data["Nilai_Asesmen_Detail"] = detail
     return data, active_filters
 

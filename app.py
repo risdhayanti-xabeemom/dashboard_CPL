@@ -129,6 +129,15 @@ OPTIONAL_SHEETS = {
         "Bobot Komponen",
         "Label Jadwal Asesmen",
     ]
+    ,
+    "Mapping_MK_Equivalency": [
+        "Kode MK Lama",
+        "Mata Kuliah Lama",
+        "Kode MK Baru",
+        "Mata Kuliah Baru",
+        "Status Konversi",
+        "Keterangan",
+    ],
 }
 
 INPUT_NORMALISASI_REQUIRED = [
@@ -231,6 +240,12 @@ COLUMN_ALIASES = {
     "nilai huruf": "Nilai Huruf",
     "parameter": "Parameter",
     "label jadwal asesmen": "Label Jadwal Asesmen",
+    "kode mk lama": "Kode MK Lama",
+    "mata kuliah lama": "Mata Kuliah Lama",
+    "kode mk baru": "Kode MK Baru",
+    "mata kuliah baru": "Mata Kuliah Baru",
+    "status konversi": "Status Konversi",
+    "keterangan": "Keterangan",
 }
 
 COMPONENT_ALIASES = {
@@ -572,6 +587,106 @@ def read_any_sheet(file_obj, sheet_name: str) -> pd.DataFrame:
     return clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl"))
 
 
+def normalize_mk_equivalency_sheet(equivalency: pd.DataFrame) -> pd.DataFrame:
+    eq = clean_dataframe(equivalency.copy())
+    for column in OPTIONAL_SHEETS["Mapping_MK_Equivalency"]:
+        if column not in eq.columns:
+            eq[column] = ""
+    for column in ["Kode MK Lama", "Kode MK Baru"]:
+        eq[column] = eq[column].map(normalize_code)
+    for column in ["Mata Kuliah Lama", "Mata Kuliah Baru", "Status Konversi", "Keterangan"]:
+        eq[column] = eq[column].fillna("").astype(str).str.strip()
+    eq = eq[OPTIONAL_SHEETS["Mapping_MK_Equivalency"]].dropna(how="all")
+    non_empty = eq.apply(lambda row: any(str(value).strip() for value in row), axis=1)
+    return eq[non_empty].reset_index(drop=True)
+
+
+def mk_equivalency_summary(equivalency: pd.DataFrame, nilai: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
+    statuses = ["Setara", "Digabung", "Dipecah", "Dihapus", "Baru"]
+    summary_rows = []
+    for status in statuses:
+        count = 0
+        if "Status Konversi" in equivalency.columns:
+            count = int((equivalency["Status Konversi"].astype(str).str.lower() == status.lower()).sum())
+        summary_rows.append({"Parameter": f"Jumlah MK {status}", "Nilai": count})
+
+    nilai_codes = set(nilai.get("Kode MK", pd.Series(dtype=str)).dropna().map(normalize_code))
+    eq_old_codes = set(equivalency.get("Kode MK Lama", pd.Series(dtype=str)).dropna().map(normalize_code))
+    mapping_codes = set(mapping.get("Kode MK", pd.Series(dtype=str)).dropna().map(normalize_code))
+    missing_codes = sorted(code for code in nilai_codes if code and code not in eq_old_codes and code not in mapping_codes)
+    summary_rows.append({"Parameter": "Daftar Kode MK belum termapping", "Nilai": ", ".join(missing_codes)})
+    return pd.DataFrame(summary_rows)
+
+
+def apply_mk_equivalency(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    if "Mapping_MK_Equivalency" not in data or "Nilai_CPMK" not in data:
+        return data
+
+    normalized = {sheet: df.copy() for sheet, df in data.items()}
+    equivalency = normalize_mk_equivalency_sheet(normalized["Mapping_MK_Equivalency"])
+    normalized["Mapping_MK_Equivalency"] = equivalency
+    if equivalency.empty:
+        return normalized
+
+    nilai = normalized["Nilai_CPMK"].copy()
+    mapping = normalized.get("Mapping_CPMK", pd.DataFrame()).copy()
+    if "Kode MK" not in nilai.columns:
+        return normalized
+
+    nilai["Kode MK"] = nilai["Kode MK"].map(normalize_code)
+    if "Mata Kuliah" not in nilai.columns:
+        nilai["Mata Kuliah"] = ""
+    nilai["Kode MK Asli"] = nilai["Kode MK"]
+    nilai["Mata Kuliah Asli"] = nilai["Mata Kuliah"]
+
+    duplicated_old = equivalency[
+        equivalency["Kode MK Lama"].duplicated(keep=False)
+        & equivalency["Kode MK Baru"].astype(str).str.strip().ne("")
+    ].copy()
+    if not duplicated_old.empty:
+        normalized["_MK_Equivalency_Duplicates"] = duplicated_old[
+            ["Kode MK Lama", "Mata Kuliah Lama", "Kode MK Baru", "Mata Kuliah Baru", "Status Konversi", "Keterangan"]
+        ].drop_duplicates()
+
+    eq_lookup = equivalency[
+        equivalency["Kode MK Lama"].astype(str).str.strip().ne("")
+        & equivalency["Kode MK Baru"].astype(str).str.strip().ne("")
+    ].copy()
+    merge_columns = [
+        "Kode MK Lama",
+        "Mata Kuliah Lama",
+        "Kode MK Baru",
+        "Mata Kuliah Baru",
+        "Status Konversi",
+        "Keterangan",
+    ]
+    nilai = nilai.merge(eq_lookup[merge_columns], left_on="Kode MK", right_on="Kode MK Lama", how="left")
+    converted_mask = nilai["Kode MK Baru"].notna() & nilai["Kode MK Baru"].astype(str).str.strip().ne("")
+    nilai.loc[converted_mask, "Kode MK"] = nilai.loc[converted_mask, "Kode MK Baru"]
+    nilai.loc[
+        converted_mask & nilai["Mata Kuliah Baru"].astype(str).str.strip().ne(""),
+        "Mata Kuliah",
+    ] = nilai.loc[converted_mask, "Mata Kuliah Baru"]
+    nilai["Status Mapping MK"] = "Tidak Perlu Konversi"
+    nilai.loc[converted_mask, "Status Mapping MK"] = nilai.loc[converted_mask, "Status Konversi"].replace("", "Setara")
+
+    if "Kode MK" in mapping.columns:
+        mapping_codes = set(mapping["Kode MK"].dropna().map(normalize_code))
+    else:
+        mapping_codes = set()
+    unresolved_mask = ~nilai["Kode MK"].map(normalize_code).isin(mapping_codes)
+    nilai.loc[unresolved_mask, "Status Mapping MK"] = "Belum Termapping"
+    normalized["Nilai_CPMK"] = nilai.drop(
+        columns=["Kode MK Lama", "Mata Kuliah Lama", "Kode MK Baru", "Mata Kuliah Baru"],
+        errors="ignore",
+    )
+    normalized["_MK_Equivalency_Validation"] = mk_equivalency_summary(equivalency, nilai, mapping)
+    missing_codes = sorted(nilai.loc[unresolved_mask, "Kode MK Asli"].dropna().astype(str).unique().tolist())
+    if missing_codes:
+        normalized["_MK_Unmapped"] = pd.DataFrame({"Kode MK": missing_codes})
+    return normalized
+
+
 def find_column(df: pd.DataFrame, name: str) -> Optional[str]:
     wanted = canonical_column_name(name)
     for column in df.columns:
@@ -860,6 +975,9 @@ def normalize_input_workbook(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.Data
         mapping["Komponen Asesmen"] = mapping["Komponen Asesmen"].map(normalize_component)
         normalized["Mapping_CPMK"] = mapping
 
+    if "Mapping_MK_Equivalency" in normalized:
+        normalized = apply_mk_equivalency(normalized)
+
     if "Nilai_CPMK" in normalized:
         nilai = normalized["Nilai_CPMK"]
         for column in REQUIRED_SHEETS["Nilai_CPMK"]:
@@ -979,6 +1097,32 @@ def get_workbook_warnings(data: Dict[str, pd.DataFrame], label: str = "file") ->
         ]
         warnings.append(
             "Data nilai belum termapping ke Mapping_CPMK untuk pasangan Kode MK/Kode CPMK: "
+            + ", ".join(pairs)
+            + "."
+        )
+
+    if "_MK_Equivalency_Validation" in data and not data["_MK_Equivalency_Validation"].empty:
+        summary = data["_MK_Equivalency_Validation"]
+        counts = []
+        for status in ["Setara", "Digabung", "Dipecah", "Dihapus", "Baru"]:
+            match = summary[summary["Parameter"] == f"Jumlah MK {status}"]
+            value = match["Nilai"].iloc[0] if not match.empty else 0
+            counts.append(f"{status}: {value}")
+        warnings.append(f"{label}: ringkasan penyetaraan Kode MK - " + ", ".join(counts) + ".")
+        missing = summary[summary["Parameter"] == "Daftar Kode MK belum termapping"]
+        if not missing.empty and str(missing["Nilai"].iloc[0]).strip():
+            warnings.append(
+                f"{label}: Terdapat Kode MK yang belum termapping: {missing['Nilai'].iloc[0]}."
+            )
+
+    if "_MK_Equivalency_Duplicates" in data and not data["_MK_Equivalency_Duplicates"].empty:
+        duplicated = data["_MK_Equivalency_Duplicates"].head(20)
+        pairs = [
+            f"{row.get('Kode MK Lama', '')} -> {row.get('Kode MK Baru', '')} ({row.get('Status Konversi', '')})"
+            for _, row in duplicated.iterrows()
+        ]
+        warnings.append(
+            f"{label}: terdapat penyetaraan Kode MK dengan lebih dari satu mapping, mohon verifikasi manual: "
             + ", ".join(pairs)
             + "."
         )
@@ -1165,6 +1309,7 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         "Mapping_CPMK": ["Kode MK", "Kode CPMK", "Kode IK", "Kode CPL"],
         "Nilai_CPMK": ["NIM", "Kode MK", "Kode CPMK", "Kode IK", "Kode CPL"],
         "Nilai_Asesmen_Detail": ["NIM", "Kode MK", "Kode CPMK", "Kode IK", "Kode CPL"],
+        "Mapping_MK_Equivalency": ["Kode MK Lama", "Kode MK Baru"],
     }
     for sheet, columns in code_columns.items():
         if sheet not in prepared:
@@ -2040,6 +2185,40 @@ def make_cqi_evaluation(
     return pd.DataFrame(rows)
 
 
+def append_mk_equivalency_to_evaluation(
+    evaluasi_cqi: pd.DataFrame, validation_frames: List[pd.DataFrame]
+) -> pd.DataFrame:
+    rows = []
+    for validation in validation_frames:
+        if validation is None or validation.empty:
+            continue
+        periode = validation["Periode"].iloc[0] if "Periode" in validation.columns and not validation.empty else "Kurikulum"
+        for _, item in validation.iterrows():
+            parameter = item.get("Parameter", "")
+            value = item.get("Nilai", "")
+            if parameter == "Daftar Kode MK belum termapping" and not str(value).strip():
+                continue
+            rows.append(
+                {
+                    "Periode Awal": periode,
+                    "Periode Berikut": "-",
+                    "Kode CPL": "MK",
+                    "Indikator Lemah": parameter,
+                    "Capaian Awal": "",
+                    "Capaian Berikut": "",
+                    "Perubahan": "",
+                    "Efektivitas": "Evaluasi Perubahan Kurikulum",
+                    "Rekomendasi Lanjutan": str(value),
+                }
+            )
+    if not rows:
+        return evaluasi_cqi
+    mk_eval = pd.DataFrame(rows)
+    if evaluasi_cqi is None or evaluasi_cqi.empty:
+        return mk_eval
+    return pd.concat([evaluasi_cqi, mk_eval], ignore_index=True)
+
+
 def dataframe_to_excel(sheets: Dict[str, pd.DataFrame]) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -2841,6 +3020,10 @@ def render_single_mode() -> None:
     trend_cpl = make_trend_cpl(rekap_cpl_period)
     trend_ik = make_trend_ik(rekap_ik_period)
     evaluasi_cqi = make_cqi_evaluation(cqi_period, rekap_cpl_period, ["Single Semester"])
+    evaluasi_cqi = append_mk_equivalency_to_evaluation(
+        evaluasi_cqi,
+        [raw_data["_MK_Equivalency_Validation"]] if "_MK_Equivalency_Validation" in raw_data else [],
+    )
 
     tab_names = [
         "Dashboard CPL",
@@ -2945,6 +3128,7 @@ def render_multi_mode() -> None:
     format_messages: List[str] = []
     period_labels: List[str] = []
     nilai_frames: List[pd.DataFrame] = []
+    mk_equivalency_validation_frames: List[pd.DataFrame] = []
     base_data: Optional[Dict[str, pd.DataFrame]] = None
 
     for item in uploads:
@@ -2973,6 +3157,10 @@ def render_multi_mode() -> None:
 
         nilai_cpmk["Periode"] = periode
         nilai_frames.append(nilai_cpmk)
+        if "_MK_Equivalency_Validation" in period_data and not period_data["_MK_Equivalency_Validation"].empty:
+            validation = period_data["_MK_Equivalency_Validation"].copy()
+            validation["Periode"] = periode
+            mk_equivalency_validation_frames.append(validation)
         period_labels.append(periode)
         validation_warnings.extend(get_workbook_warnings(period_data, periode))
         format_messages.extend(f"{periode}: {message}" for message in get_format_messages(period_data))
@@ -3063,6 +3251,7 @@ def render_multi_mode() -> None:
     trend_ik = make_trend_ik(rekap_ik_all)
     cqi_all = add_cqi_tracking(cqi_all_raw, rekap_cpl_all, period_order)
     evaluasi_cqi = make_cqi_evaluation(cqi_all_raw, rekap_cpl_all, period_order)
+    evaluasi_cqi = append_mk_equivalency_to_evaluation(evaluasi_cqi, mk_equivalency_validation_frames)
 
     render_download_buttons_multi(
         rekap_cpmk_all,

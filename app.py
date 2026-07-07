@@ -220,10 +220,22 @@ COLUMN_ALIASES = {
     "rumusan ik": "Rumusan IK",
     "notasi ik": "Notasi IK",
     "tahun akademik": "Tahun Akademik",
+    "tahun ajaran": "Tahun Akademik",
+    "ta": "Tahun Akademik",
+    "periode": "Tahun Akademik",
+    "tahun": "Tahun Akademik",
     "semester": "Semester",
     "semester akademik": "Semester Akademik",
+    "semester aktif": "Semester Akademik",
+    "ganjil genap": "Semester Akademik",
+    "semester gasal genap": "Semester Akademik",
     "semester kurikulum": "Semester Kurikulum",
+    "semester ke": "Semester Kurikulum",
+    "semester_ke": "Semester Kurikulum",
+    "sem": "Semester Kurikulum",
     "angkatan": "Angkatan",
+    "tahun angkatan": "Angkatan",
+    "cohort": "Angkatan",
     "kelas": "Kelas",
     "kode mk": "Kode MK",
     "mata kuliah": "Mata Kuliah",
@@ -1091,6 +1103,15 @@ def validate_workbook(data: Dict[str, pd.DataFrame], label: str = "file") -> Lis
 
 def get_workbook_warnings(data: Dict[str, pd.DataFrame], label: str = "file") -> List[str]:
     warnings: List[str] = []
+
+    if "Nilai_CPMK" in data:
+        detected = detect_global_filter_columns(data)
+        for filter_label in ["Tahun Akademik", "Semester Akademik", "Semester Kurikulum", "Angkatan"]:
+            column = detected.get(filter_label)
+            if column:
+                warnings.append(f"{label}: Kolom {filter_label} terdeteksi: {column}.")
+            else:
+                warnings.append(f"{label}: Kolom {filter_label} belum tersedia.")
 
     if "_Missing_Mapping" in data and not data["_Missing_Mapping"].empty:
         missing = data["_Missing_Mapping"].head(20)
@@ -2531,23 +2552,6 @@ def unique_filter_options(data: Dict[str, pd.DataFrame], column: str) -> List[st
 def render_filter_controls(data: Dict[str, pd.DataFrame], key_prefix: str) -> Dict[str, List[str]]:
     sidebar_section("Filter Dashboard")
     filters = {
-        "Tahun Akademik": st.multiselect(
-            "Tahun Akademik", unique_filter_options(data, "Tahun Akademik"), key=f"{key_prefix}_filter_tahun"
-        ),
-        "Semester Akademik": st.multiselect(
-            "Semester Akademik",
-            unique_filter_options(data, "Semester Akademik"),
-            key=f"{key_prefix}_filter_semester_akademik",
-        ),
-        "Semester Kurikulum": [],
-        "Angkatan": st.multiselect(
-            "Angkatan",
-            unique_filter_options(data, "Angkatan"),
-            key=f"{key_prefix}_filter_angkatan",
-        ),
-        "Semester": st.multiselect(
-            "Semester", unique_filter_options(data, "Semester"), key=f"{key_prefix}_filter_semester"
-        ),
         "Mata Kuliah": st.multiselect(
             "Mata Kuliah", unique_filter_options(data, "Mata Kuliah"), key=f"{key_prefix}_filter_mk"
         ),
@@ -2562,24 +2566,6 @@ def render_filter_controls(data: Dict[str, pd.DataFrame], key_prefix: str) -> Di
     filters["Komponen"] = st.multiselect(
         "Komponen Asesmen", component_options, key=f"{key_prefix}_filter_component"
     )
-    semester_kurikulum_options = [
-        "Semua Semester",
-        "Semester 1",
-        "Semester 2",
-        "Semester 3",
-        "Semester 4",
-        "Semester 5",
-        "Semester 6",
-    ]
-    available_semester_kurikulum = unique_filter_options(data, "Semester Kurikulum")
-    if available_semester_kurikulum:
-        selected_semester_kurikulum = st.selectbox(
-            "Semester Kurikulum",
-            semester_kurikulum_options,
-            key=f"{key_prefix}_filter_semester_kurikulum",
-        )
-        if selected_semester_kurikulum != "Semua Semester":
-            filters["Semester Kurikulum"] = [selected_semester_kurikulum]
     return filters
 
 
@@ -3071,19 +3057,22 @@ def render_single_mode() -> None:
             step=1.0,
         )
         st.divider()
-        filters = render_filter_controls(raw_data, "single")
+        raw_data_global, global_filters = render_global_filters(raw_data, "single_global")
+        st.divider()
+        filters = render_filter_controls(raw_data_global, "single")
         st.divider()
         render_sidebar_system_info("Single Semester")
 
-    filtered_data = apply_workbook_filters(raw_data, filters)
-    render_active_filter_context(filters)
+    filtered_data = apply_workbook_filters(raw_data_global, filters)
+    export_filters = {**filters, **global_filters}
+    render_active_filter_context(global_filters)
     result = calculate_all(filtered_data, batas_nilai, target_cpl)
     rekap_cpmk = result["rekap_cpmk"]
     rekap_ik = result["rekap_ik"]
     rekap_cpl = result["rekap_cpl"]
     cqi = result["cqi"]
 
-    render_download_buttons_single(rekap_cpmk, rekap_ik, rekap_cpl, cqi, filters)
+    render_download_buttons_single(rekap_cpmk, rekap_ik, rekap_cpl, cqi, export_filters)
 
     rekap_cpl_period = add_period_columns(rekap_cpl, "Single Semester", "-", "-")
     rekap_ik_period = add_period_columns(rekap_ik, "Single Semester", "-", "-")
@@ -3243,6 +3232,10 @@ def render_multi_mode() -> None:
         return
 
     combined_nilai_cpmk = pd.concat(nilai_frames, ignore_index=True)
+    global_filter_data, global_filters = render_global_filters(
+        {"Nilai_CPMK": combined_nilai_cpmk}, "multi_global"
+    )
+    combined_nilai_cpmk = global_filter_data["Nilai_CPMK"]
     for periode in period_labels:
         period_nilai = combined_nilai_cpmk[
             combined_nilai_cpmk["Periode"].astype(str) == str(periode)
@@ -3306,7 +3299,8 @@ def render_multi_mode() -> None:
     cqi_all_raw = filter_frame(cqi_all_raw, multi_filters)
     if not detail_asesmen_all.empty:
         detail_asesmen_all = filter_frame(detail_asesmen_all, multi_filters, "Komponen")
-    render_active_filter_context(multi_filters)
+    export_filters = {**multi_filters, **global_filters}
+    render_active_filter_context(global_filters)
 
     selected_period_count = (
         rekap_cpmk_all["Periode"].dropna().astype(str).nunique()
@@ -3333,7 +3327,7 @@ def render_multi_mode() -> None:
         trend_ik,
         cqi_all,
         evaluasi_cqi,
-        multi_filters,
+        export_filters,
     )
 
     tab_names = [
@@ -3841,6 +3835,23 @@ def semester_kurikulum_label(value: object) -> str:
     return f"Semester {int(match.group(1))}"
 
 
+def natural_sort_key(value: object):
+    parts = re.split(r"(\d+)", str(value))
+    return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
+
+
+def find_column_by_alias(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
+    normalized_cols = {
+        str(col).strip().lower().replace("_", " "): col
+        for col in df.columns
+    }
+    for alias in aliases:
+        key = alias.strip().lower().replace("_", " ")
+        if key in normalized_cols:
+            return normalized_cols[key]
+    return None
+
+
 def semester_kurikulum_matches(series: pd.Series, selected: List[str]) -> pd.Series:
     selected_labels = {semester_kurikulum_label(value) for value in selected}
     return series.map(semester_kurikulum_label).isin(selected_labels)
@@ -3850,6 +3861,8 @@ def filter_info_dataframe(filters: Dict[str, List[str]]) -> pd.DataFrame:
     rows = []
     for column in ["Tahun Akademik", "Semester Akademik", "Semester Kurikulum", "Angkatan"]:
         selected = filters.get(column, [])
+        if isinstance(selected, str):
+            selected = [] if selected in {"", "Semua", "Semua Semester"} else [selected]
         rows.append(
             {
                 "Filter": column,
@@ -3861,15 +3874,103 @@ def filter_info_dataframe(filters: Dict[str, List[str]]) -> pd.DataFrame:
 
 def render_active_filter_context(filters: Dict[str, List[str]]) -> None:
     semester = filters.get("Semester Kurikulum", [])
+    if isinstance(semester, str):
+        semester = [] if semester in {"", "Semua", "Semua Semester"} else [semester]
     semester_text = semester[0] if semester else "Semua Semester"
     details = filter_info_dataframe(filters)
     extra = []
     for column in ["Tahun Akademik", "Semester Akademik", "Angkatan"]:
         selected = filters.get(column, [])
+        if isinstance(selected, str):
+            selected = [] if selected in {"", "Semua", "Semua Semester"} else [selected]
         if selected:
             extra.append(f"{column}: {', '.join(selected)}")
     suffix = " | " + " | ".join(extra) if extra else ""
-    st.info(f"Data yang ditampilkan: {semester_text}{suffix}")
+    if not semester and not extra:
+        st.info("Data yang ditampilkan: Semua Data")
+    else:
+        st.info(f"Data yang ditampilkan: {semester_text}{suffix}")
+
+
+GLOBAL_FILTER_ALIASES = {
+    "Tahun Akademik": ["Tahun Akademik", "Tahun Ajaran", "TA", "Periode", "Tahun"],
+    "Semester Akademik": ["Semester Akademik", "Semester Aktif", "Ganjil Genap", "Semester Gasal Genap"],
+    "Semester Kurikulum": ["Semester Kurikulum", "Semester", "Semester Ke", "Semester_ke", "Sem"],
+    "Angkatan": ["Angkatan", "Tahun Angkatan", "Cohort"],
+}
+
+
+def detect_global_filter_columns(raw_data: Dict[str, pd.DataFrame]) -> Dict[str, Optional[str]]:
+    if "Nilai_CPMK" not in raw_data:
+        return {label: None for label in GLOBAL_FILTER_ALIASES}
+    nilai = raw_data["Nilai_CPMK"]
+    return {
+        label: find_column_by_alias(nilai, aliases)
+        for label, aliases in GLOBAL_FILTER_ALIASES.items()
+    }
+
+
+def render_global_filters(raw_data: Dict[str, pd.DataFrame], key_prefix: str = "global"):
+    data = {k: v.copy() for k, v in raw_data.items()}
+    active_filters: Dict[str, str] = {}
+    if "Nilai_CPMK" not in data:
+        return data, active_filters
+
+    df = data["Nilai_CPMK"].copy()
+    detected_columns = detect_global_filter_columns(data)
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Filter Data")
+
+    def sidebar_filter(label: str, col: Optional[str]) -> str:
+        nonlocal df
+        if col is None or col not in df.columns:
+            st.sidebar.caption(f"Kolom {label} belum tersedia pada Nilai_CPMK")
+            active_filters[label] = "Semua"
+            return "Semua"
+
+        values = (
+            df[col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        if label == "Semester Kurikulum":
+            values = sorted({semester_kurikulum_label(value) for value in values}, key=natural_sort_key)
+        else:
+            values = sorted(values, key=natural_sort_key)
+        options = ["Semua"] + values
+        selected = st.sidebar.selectbox(label, options, key=f"{key_prefix}_filter_{label.replace(' ', '_').lower()}")
+
+        if selected != "Semua":
+            if label == "Semester Kurikulum":
+                df = df[semester_kurikulum_matches(df[col], [selected])]
+            else:
+                df = df[df[col].astype(str).str.strip() == selected]
+
+        active_filters[label] = selected
+        return selected
+
+    for label in ["Tahun Akademik", "Semester Akademik", "Semester Kurikulum", "Angkatan"]:
+        sidebar_filter(label, detected_columns.get(label))
+
+    data["Nilai_CPMK"] = df
+    if "Nilai_Asesmen_Detail" in data:
+        detail = data["Nilai_Asesmen_Detail"].copy()
+        for label, aliases in GLOBAL_FILTER_ALIASES.items():
+            selected = active_filters.get(label, "Semua")
+            col = find_column_by_alias(detail, aliases)
+            if selected != "Semua" and col in detail.columns:
+                if label == "Semester Kurikulum":
+                    detail = detail[semester_kurikulum_matches(detail[col], [selected])]
+                else:
+                    detail = detail[detail[col].astype(str).str.strip() == selected]
+        data["Nilai_Asesmen_Detail"] = detail
+    return data, active_filters
 
 
 def _final_cpl_master(master_cpl: pd.DataFrame) -> pd.DataFrame:

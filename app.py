@@ -214,6 +214,7 @@ LOGO_CANDIDATES = {
 
 COLUMN_ALIASES = {
     "kode cpl": "Kode CPL",
+    "cpl": "Kode CPL",
     "rumusan cpl": "Rumusan CPL",
     "ga iabee": "GA IABEE",
     "kode ik": "Kode IK",
@@ -222,7 +223,7 @@ COLUMN_ALIASES = {
     "tahun akademik": "Tahun Akademik",
     "tahun ajaran": "Tahun Akademik",
     "ta": "Tahun Akademik",
-    "periode": "Tahun Akademik",
+    "periode": "Periode",
     "tahun": "Tahun Akademik",
     "semester": "Semester",
     "semester akademik": "Semester Akademik",
@@ -1133,7 +1134,7 @@ def get_workbook_warnings(data: Dict[str, pd.DataFrame], label: str = "file") ->
 
     if "Nilai_CPMK" in data:
         detected = detect_global_filter_columns(data)
-        for filter_label in ["Tahun Akademik", "Semester Akademik", "Semester Kurikulum", "Angkatan"]:
+        for filter_label in ["Angkatan", "Tahun Akademik", "Semester Akademik", "Periode", "Semester Kurikulum", "Kode CPL"]:
             column = detected.get(filter_label)
             if column:
                 warnings.append(f"{label}: Kolom {filter_label} terdeteksi: {column}.")
@@ -1453,9 +1454,60 @@ def add_period_columns(df: pd.DataFrame, periode: str, tahun_akademik: str, seme
     return output
 
 
-def calculate_rekap_cpmk(
-    mapping: pd.DataFrame, nilai: pd.DataFrame, batas_nilai_minimum: float
-) -> pd.DataFrame:
+def get_student_key_columns(df: pd.DataFrame) -> Optional[List[str]]:
+    if df is None or df.empty:
+        return None
+    if "NIM" in df.columns and "Nama Mahasiswa" in df.columns:
+        return ["NIM", "Nama Mahasiswa"]
+    if "NIM" in df.columns:
+        return ["NIM"]
+    if "Nama Mahasiswa" in df.columns:
+        return ["Nama Mahasiswa"]
+    return None
+
+
+def count_unique_students(df: pd.DataFrame) -> int:
+    if df is None or df.empty:
+        return 0
+    keys = get_student_key_columns(df)
+    if keys is None:
+        return len(df)
+    return df[keys].drop_duplicates().shape[0]
+
+
+def first_non_empty_value(series: pd.Series, default: str = ""):
+    if series is None:
+        return default
+    cleaned = series.dropna()
+    if cleaned.empty:
+        return default
+    cleaned = cleaned.astype(str).str.strip()
+    cleaned = cleaned[~cleaned.str.lower().isin(["", "nan", "none", "-"])]
+    if cleaned.empty:
+        return default
+    return cleaned.iloc[0]
+
+
+def weighted_student_score(group: pd.DataFrame) -> float:
+    values = pd.to_numeric(group["Nilai_Bersih"], errors="coerce").dropna().clip(0, 100)
+    if values.empty:
+        return 0.0
+    weight_col = pick_existing_column(
+        group,
+        ["Bobot_Komponen_Bersih", "Bobot Komponen", "Bobot_CPMK_Bersih", "Bobot CPMK"],
+    )
+    if weight_col is None:
+        return float(values.mean())
+    weights = pd.to_numeric(group.loc[values.index, weight_col], errors="coerce")
+    weights = weights.where(weights > 0, pd.NA).fillna(1)
+    if weights.sum() <= 0:
+        return float(values.mean())
+    return float((values * weights).sum() / weights.sum())
+
+
+def build_student_cpmk_df(nilai: pd.DataFrame) -> pd.DataFrame:
+    if nilai is None or nilai.empty:
+        return pd.DataFrame()
     nilai_valid = nilai.dropna(subset=["Kode CPMK", "Nilai_Bersih"]).copy()
     nilai_valid = filter_valid_codes(
         nilai_valid,
@@ -1463,9 +1515,19 @@ def calculate_rekap_cpmk(
         require_ik="Kode IK" in nilai_valid.columns,
         require_cpmk=True,
     )
-    nilai_valid["Nilai_Bersih"] = clamp_score(nilai_valid["Nilai_Bersih"])
-    nilai_valid["Tercapai"] = nilai_valid["Nilai_Bersih"] > CPL_STUDENT_ACHIEVEMENT_THRESHOLD
-    group_keys = [
+    if nilai_valid.empty:
+        return nilai_valid
+    nilai_valid["Nilai_Bersih"] = clamp_score(nilai_valid["Nilai_Bersih"]).fillna(0)
+    student_keys = get_student_key_columns(nilai_valid)
+    if student_keys is None:
+        nilai_valid["_Mahasiswa_Key"] = nilai_valid.index.astype(str)
+        student_keys = ["_Mahasiswa_Key"]
+    group_keys = student_keys + [
+        column
+        for column in ["Kode CPMK", "Kode CPL", "Kode IK"]
+        if column in nilai_valid.columns
+    ]
+    label_columns = [
         column
         for column in [
             "Tahun Akademik",
@@ -1475,42 +1537,114 @@ def calculate_rekap_cpmk(
             "Angkatan",
             "Kode MK",
             "Mata Kuliah",
-            "Kode CPMK",
-            "Kode CPL",
-            "Kode IK",
+            "Notasi IK",
         ]
-        if column in nilai_valid.columns
+        if column in nilai_valid.columns and column not in group_keys
     ]
-    if not group_keys:
-        group_keys = ["Kode CPMK"]
-    grouped = (
-        nilai_valid.groupby(group_keys, as_index=False, dropna=False)
-        .agg(
-            **{
-                "Jumlah Mahasiswa": ("NIM", "nunique"),
-                "Rata-rata Nilai": ("Nilai_Bersih", "mean"),
-            }
+    rows = []
+    for keys, group in nilai_valid.groupby(group_keys, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = dict(zip(group_keys, keys))
+        row["Nilai CPMK Mahasiswa"] = max(0.0, min(100.0, weighted_student_score(group)))
+        for column in label_columns:
+            row[column] = first_non_empty_value(group[column])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def validate_rekap_cpmk_counts(rekap_cpmk: pd.DataFrame, nilai: pd.DataFrame) -> None:
+    if rekap_cpmk is None or rekap_cpmk.empty:
+        return
+    if {"Jumlah Mahasiswa", "Jumlah Mahasiswa Tercapai"}.issubset(rekap_cpmk.columns):
+        invalid = rekap_cpmk[
+            pd.to_numeric(rekap_cpmk["Jumlah Mahasiswa Tercapai"], errors="coerce").fillna(0)
+            > pd.to_numeric(rekap_cpmk["Jumlah Mahasiswa"], errors="coerce").fillna(0)
+        ]
+        if not invalid.empty:
+            st.warning(
+                "Ada CPMK dengan jumlah mahasiswa tercapai lebih besar dari jumlah mahasiswa. "
+                "Periksa agregasi mahasiswa unik."
+            )
+    max_students = count_unique_students(nilai)
+    if max_students <= 0 or "Jumlah Mahasiswa" not in rekap_cpmk.columns:
+        return
+    too_large = rekap_cpmk[
+        pd.to_numeric(rekap_cpmk["Jumlah Mahasiswa"], errors="coerce").fillna(0) > max_students
+    ]
+    if not too_large.empty:
+        st.warning(
+            "Ada CPMK dengan jumlah mahasiswa melebihi jumlah mahasiswa unik pada data aktif. "
+            "Dashboard sudah mencoba mengagregasi mahasiswa unik; mohon cek kemungkinan duplikasi kode CPMK."
         )
-    )
-    achieved_counts = (
-        nilai_valid[nilai_valid["Tercapai"]]
-        .groupby(group_keys, as_index=False, dropna=False)
-        .agg(**{"Jumlah Mahasiswa Tercapai": ("NIM", "nunique")})
-    )
-    grouped = grouped.merge(achieved_counts, on=group_keys, how="left")
-    grouped["Jumlah Mahasiswa Tercapai"] = (
-        pd.to_numeric(grouped["Jumlah Mahasiswa Tercapai"], errors="coerce").fillna(0).astype(int)
-    )
+
+
+def calculate_rekap_cpmk(
+    mapping: pd.DataFrame, nilai: pd.DataFrame, batas_nilai_minimum: float
+) -> pd.DataFrame:
+    student_cpmk = build_student_cpmk_df(nilai)
+    group_keys = [
+        column
+        for column in ["Kode CPMK", "Kode CPL", "Kode IK"]
+        if column in student_cpmk.columns
+    ]
+    if not group_keys and "Kode CPMK" in student_cpmk.columns:
+        group_keys = ["Kode CPMK"]
+
+    grouped_rows = []
+    if group_keys and not student_cpmk.empty:
+        for keys, group in student_cpmk.groupby(group_keys, dropna=False):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            row = dict(zip(group_keys, keys))
+            jumlah = count_unique_students(group)
+            achieved = group[
+                pd.to_numeric(group["Nilai CPMK Mahasiswa"], errors="coerce").fillna(0)
+                > CPL_STUDENT_ACHIEVEMENT_THRESHOLD
+            ]
+            tercapai = min(count_unique_students(achieved), jumlah)
+            capaian = pd.to_numeric(group["Nilai CPMK Mahasiswa"], errors="coerce").fillna(0).mean()
+            row.update(
+                {
+                    "Jumlah Mahasiswa": int(jumlah),
+                    "Jumlah Mahasiswa Tercapai": int(tercapai),
+                    "Rata-rata Nilai": max(0.0, min(100.0, float(capaian) if pd.notna(capaian) else 0.0)),
+                }
+            )
+            for column in [
+                "Tahun Akademik",
+                "Semester Akademik",
+                "Semester",
+                "Semester Kurikulum",
+                "Angkatan",
+                "Kode MK",
+                "Mata Kuliah",
+                "Notasi IK",
+            ]:
+                if column in group.columns:
+                    row[column] = first_non_empty_value(group[column])
+            grouped_rows.append(row)
+
+    grouped = pd.DataFrame(grouped_rows)
+    if grouped.empty:
+        grouped = pd.DataFrame(
+            columns=(group_keys or ["Kode CPMK"])
+            + ["Jumlah Mahasiswa", "Jumlah Mahasiswa Tercapai", "Rata-rata Nilai"]
+        )
     grouped["Persentase CPMK"] = (
-        grouped["Jumlah Mahasiswa Tercapai"] / grouped["Jumlah Mahasiswa"] * 100
+        grouped["Jumlah Mahasiswa Tercapai"] / grouped["Jumlah Mahasiswa"].replace(0, pd.NA) * 100
     ).fillna(0).clip(lower=0, upper=100)
+    grouped["Persentase Ketercapaian (%)"] = grouped["Persentase CPMK"]
     grouped["Capaian CPMK"] = clamp_score(grouped["Rata-rata Nilai"]).fillna(0)
     grouped["Kriteria"] = grouped["Capaian CPMK"].apply(classify_achievement)
     grouped["Status"] = grouped["Capaian CPMK"].apply(classify_status_by_score)
 
     mapping_columns = [
         "Tahun Akademik",
+        "Semester Akademik",
         "Semester",
+        "Semester Kurikulum",
+        "Angkatan",
         "Kode MK",
         "Mata Kuliah",
         "Kode CPMK",
@@ -1521,9 +1655,6 @@ def calculate_rekap_cpmk(
         "Bobot_CPMK_Bersih",
     ]
     mapping_unique_key = [
-        "Tahun Akademik",
-        "Semester",
-        "Kode MK",
         "Kode CPMK",
         "Kode CPL",
         "Kode IK",
@@ -1536,7 +1667,9 @@ def calculate_rekap_cpmk(
         require_ik="Kode IK" in mapping_unique.columns,
         require_cpmk=True,
     )
-    mapping_unique = mapping_unique.drop_duplicates(subset=mapping_unique_key)
+    mapping_unique_key = [key for key in mapping_unique_key if key in mapping_unique.columns]
+    if mapping_unique_key:
+        mapping_unique = mapping_unique.drop_duplicates(subset=mapping_unique_key)
     if "Bobot_CPMK_Bersih" not in mapping_unique.columns:
         mapping_unique["Bobot_CPMK_Bersih"] = clean_weight_series(mapping_unique.get("Bobot CPMK", 1))
 
@@ -1558,8 +1691,22 @@ def calculate_rekap_cpmk(
     ]
     rekap[fill_zero_columns] = rekap[fill_zero_columns].fillna(0)
     rekap = clamp_rekap_scores(rekap, ["Rata-rata Nilai", "Persentase CPMK", "Capaian CPMK"])
+    if "Persentase Ketercapaian (%)" not in rekap.columns:
+        rekap["Persentase Ketercapaian (%)"] = rekap["Persentase CPMK"]
+    else:
+        rekap["Persentase Ketercapaian (%)"] = (
+            pd.to_numeric(rekap["Persentase Ketercapaian (%)"], errors="coerce")
+            .fillna(rekap["Persentase CPMK"])
+            .clip(0, 100)
+        )
+    rekap["Jumlah Mahasiswa"] = pd.to_numeric(rekap["Jumlah Mahasiswa"], errors="coerce").fillna(0).astype(int)
+    rekap["Jumlah Mahasiswa Tercapai"] = (
+        pd.to_numeric(rekap["Jumlah Mahasiswa Tercapai"], errors="coerce").fillna(0).astype(int)
+    )
+    rekap["Jumlah Mahasiswa Tercapai"] = rekap[["Jumlah Mahasiswa Tercapai", "Jumlah Mahasiswa"]].min(axis=1)
     rekap["Kriteria"] = rekap["Capaian CPMK"].apply(classify_achievement)
     rekap["Status"] = rekap["Capaian CPMK"].apply(classify_status_by_score)
+    validate_rekap_cpmk_counts(rekap, student_cpmk)
     return rekap.sort_values(["Kode CPL", "Kode IK", "Kode MK", "Kode CPMK"]).reset_index(drop=True)
 
 
@@ -3899,44 +4046,45 @@ def semester_kurikulum_matches(series: pd.Series, selected: List[str]) -> pd.Ser
 
 def filter_info_dataframe(filters: Dict[str, List[str]]) -> pd.DataFrame:
     rows = []
-    for column in ["Tahun Akademik", "Semester Akademik", "Semester Kurikulum", "Angkatan"]:
+    for column in ["Angkatan", "Tahun Akademik", "Semester Akademik", "Periode", "Semester Kurikulum", "Kode CPL"]:
         selected = filters.get(column, [])
         if isinstance(selected, str):
             selected = [] if selected in {"", "Semua", "Semua Semester"} else [selected]
         rows.append(
             {
-                "Filter": column,
-                "Nilai": ", ".join(selected) if selected else "Semua",
+                "Nama Filter": column,
+                "Nilai Terpilih": ", ".join(selected) if selected else "Semua",
             }
         )
     return pd.DataFrame(rows)
 
 
 def render_active_filter_context(filters: Dict[str, List[str]]) -> None:
-    semester = filters.get("Semester Kurikulum", [])
-    if isinstance(semester, str):
-        semester = [] if semester in {"", "Semua", "Semua Semester"} else [semester]
-    semester_text = semester[0] if semester else "Semua Semester"
-    details = filter_info_dataframe(filters)
-    extra = []
-    for column in ["Tahun Akademik", "Semester Akademik", "Angkatan"]:
+    parts = []
+    for column in ["Angkatan", "Tahun Akademik", "Semester Akademik", "Periode", "Semester Kurikulum", "Kode CPL"]:
         selected = filters.get(column, [])
         if isinstance(selected, str):
             selected = [] if selected in {"", "Semua", "Semua Semester"} else [selected]
         if selected:
-            extra.append(f"{column}: {', '.join(selected)}")
-    suffix = " | " + " | ".join(extra) if extra else ""
-    if not semester and not extra:
+            if column == "Semester Kurikulum":
+                parts.append(f"Semester Kurikulum {', '.join(str(item).replace('Semester ', '') for item in selected)}")
+            elif column == "Kode CPL":
+                parts.append(f"CPL {', '.join(selected)}")
+            else:
+                parts.append(f"{column} {', '.join(selected)}")
+    if not parts:
         st.info("Data yang ditampilkan: Semua Data")
     else:
-        st.info(f"Data yang ditampilkan: {semester_text}{suffix}")
+        st.info("Data yang ditampilkan: " + " | ".join(parts))
 
 
 GLOBAL_FILTER_ALIASES = {
-    "Tahun Akademik": ["Tahun Akademik", "Tahun Ajaran", "TA", "Periode", "Tahun"],
-    "Semester Akademik": ["Semester Akademik", "Semester Aktif", "Ganjil Genap", "Semester Gasal Genap"],
-    "Semester Kurikulum": ["Semester Kurikulum", "Semester", "Semester Ke", "Semester_ke", "Sem"],
     "Angkatan": ["Angkatan", "Tahun Angkatan", "Cohort"],
+    "Tahun Akademik": ["Tahun Akademik", "Tahun Ajaran", "TA", "Tahun"],
+    "Semester Akademik": ["Semester Akademik", "Semester Aktif", "Ganjil Genap", "Semester Gasal Genap"],
+    "Periode": ["Periode"],
+    "Semester Kurikulum": ["Semester Kurikulum", "Semester", "Semester Ke", "Semester_ke", "Sem"],
+    "Kode CPL": ["Kode CPL", "CPL"],
 }
 
 
@@ -3958,6 +4106,16 @@ def render_global_filters(raw_data: Dict[str, pd.DataFrame], key_prefix: str = "
 
     df = data["Nilai_CPMK"].copy()
     detected_columns = detect_global_filter_columns(data)
+    tahun_col = detected_columns.get("Tahun Akademik")
+    sem_ak_col = detected_columns.get("Semester Akademik")
+    periode_col = detected_columns.get("Periode")
+    if periode_col is None and tahun_col is not None and sem_ak_col is not None:
+        tahun_series = get_series_safe(df, tahun_col)
+        sem_series = get_series_safe(df, sem_ak_col)
+        if tahun_series is not None and sem_series is not None:
+            df["Periode"] = tahun_series.astype(str).str.strip() + " " + sem_series.astype(str).str.strip()
+            periode_col = "Periode"
+            detected_columns["Periode"] = "Periode"
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filter Data")
@@ -3995,10 +4153,21 @@ def render_global_filters(raw_data: Dict[str, pd.DataFrame], key_prefix: str = "
         active_filters[label] = selected
         return selected
 
-    for label in ["Tahun Akademik", "Semester Akademik", "Semester Kurikulum", "Angkatan"]:
+    for label in ["Angkatan", "Tahun Akademik", "Semester Akademik", "Periode", "Semester Kurikulum", "Kode CPL"]:
         sidebar_filter(label, detected_columns.get(label))
 
     data["Nilai_CPMK"] = df
+    if "Mapping_CPMK" in data:
+        mapping = data["Mapping_CPMK"].copy()
+        keys = [
+            key
+            for key in ["Kode MK", "Kode CPMK", "Kode CPL", "Kode IK"]
+            if key in df.columns and key in mapping.columns
+        ]
+        if keys:
+            allowed = df[keys].drop_duplicates()
+            mapping = mapping.merge(allowed, on=keys, how="inner")
+        data["Mapping_CPMK"] = mapping
     if "Nilai_Asesmen_Detail" in data:
         detail = data["Nilai_Asesmen_Detail"].copy()
         for label, aliases in GLOBAL_FILTER_ALIASES.items():
@@ -4462,8 +4631,8 @@ def prepare_trend_cpmk(rekap_cpmk: pd.DataFrame) -> pd.DataFrame:
             if "Jumlah Mahasiswa Tercapai" in group.columns
             else pd.Series([0], index=[0])
         )
-        jumlah = jumlah_series.sum()
-        tercapai = tercapai_series.sum()
+        jumlah = jumlah_series.max()
+        tercapai = min(tercapai_series.max(), jumlah)
         percent = (tercapai / jumlah * 100) if jumlah > 0 else 0.0
         row.update(
             {
@@ -4525,8 +4694,9 @@ def aggregate_rekap_cpmk_multi(rekap_cpmk: pd.DataFrame) -> pd.DataFrame:
             capaian = float((scores * weights).sum() / weights.sum())
         else:
             capaian = float(scores.mean()) if len(scores) else 0.0
-        jumlah = int(weights.sum())
-        tercapai = int(pd.to_numeric(group["Jumlah Mahasiswa Tercapai"], errors="coerce").fillna(0).sum())
+        jumlah = int(weights.max()) if not weights.empty else 0
+        tercapai_values = pd.to_numeric(group["Jumlah Mahasiswa Tercapai"], errors="coerce").fillna(0)
+        tercapai = int(min(tercapai_values.max() if not tercapai_values.empty else 0, jumlah))
         percent = (tercapai / jumlah * 100) if jumlah > 0 else 0.0
         row.update(
             {

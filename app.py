@@ -3993,39 +3993,72 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
         ],
     )
     if value_col is None:
-        st.warning("Data Tren CPL belum memiliki kolom persentase CPMK.")
+        st.warning("Data Tren CPL belum memiliki kolom Capaian CPMK atau Rata-rata Nilai.")
         return
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0).clip(0, 100)
-    df["Kriteria"] = df[value_col].apply(classify_achievement)
-    cpmk_col = "Kode CPMK" if "Kode CPMK" in df.columns else None
-    if cpmk_col:
-        df = df.drop_duplicates(["Kode CPL", cpmk_col])
-    df = df.sort_values("Kode CPL")
+    weight_col = pick_existing_column(df, ["Bobot_CPMK_Bersih", "Bobot CPMK"])
+    if weight_col:
+        df["_Bobot_CPMK_Agregat"] = clean_weight_series(df[weight_col])
+    else:
+        df["_Bobot_CPMK_Agregat"] = 1.0
+    df["_Bobot_CPMK_Agregat"] = pd.to_numeric(df["_Bobot_CPMK_Agregat"], errors="coerce").fillna(1)
+    df["_Bobot_CPMK_Agregat"] = df["_Bobot_CPMK_Agregat"].where(df["_Bobot_CPMK_Agregat"] > 0, 1)
+
+    cpmk_rows = []
+    for (kode_cpl, kode_cpmk), group in df.groupby(["Kode CPL", "Kode CPMK"], dropna=False):
+        scores = pd.to_numeric(group[value_col], errors="coerce").fillna(0).clip(0, 100)
+        weights = pd.to_numeric(group["_Bobot_CPMK_Agregat"], errors="coerce").fillna(1)
+        weights = weights.where(weights > 0, 1)
+        if weights.sum() > 0:
+            cpmk_score = float((scores * weights).sum() / weights.sum())
+        else:
+            cpmk_score = float(scores.mean()) if len(scores) else 0.0
+        cpmk_rows.append(
+            {
+                "Kode CPL": kode_cpl,
+                "Kode CPMK": kode_cpmk,
+                "Capaian CPMK Agregat": max(0.0, min(100.0, cpmk_score)),
+            }
+        )
+
+    cpmk_by_cpl_df = pd.DataFrame(cpmk_rows)
+    if cpmk_by_cpl_df.empty:
+        st.info("Tidak ada CPMK agregat yang dapat dihitung untuk Tren CPL.")
+        return
+    cpmk_by_cpl_df["Kriteria CPMK"] = cpmk_by_cpl_df["Capaian CPMK Agregat"].apply(classify_achievement)
+    cpmk_by_cpl_df = cpmk_by_cpl_df.sort_values(["Kode CPL", "Kode CPMK"])
 
     category_order = ["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]
-    counts = df["Kriteria"].value_counts()
+    counts = cpmk_by_cpl_df["Kriteria CPMK"].value_counts()
     cols = st.columns(5)
     for idx, label in enumerate(category_order):
         cols[idx].metric(f"Jumlah CPMK {label}", int(counts.get(label, 0)))
 
     grouped = (
-        df.groupby(["Kode CPL", "Kriteria"], dropna=False)
+        cpmk_by_cpl_df.groupby(["Kode CPL", "Kriteria CPMK"], dropna=False)
         .size()
         .reset_index(name="Jumlah CPMK")
     )
     totals = grouped.groupby("Kode CPL")["Jumlah CPMK"].transform("sum").replace(0, pd.NA)
     grouped["Persentase Komposisi CPMK (%)"] = (grouped["Jumlah CPMK"] / totals * 100).fillna(0).clip(0, 100)
-    grouped["Kriteria"] = pd.Categorical(grouped["Kriteria"], categories=category_order, ordered=True)
-    grouped = grouped.sort_values(["Kode CPL", "Kriteria"])
+    grouped["Kriteria CPMK"] = pd.Categorical(grouped["Kriteria CPMK"], categories=category_order, ordered=True)
+    grouped = grouped.sort_values(["Kode CPL", "Kriteria CPMK"])
+    percent_check = grouped.groupby("Kode CPL")["Persentase Komposisi CPMK (%)"].sum().round(2)
+    invalid_percent = percent_check[(percent_check - 100).abs() > 0.05]
+    if not invalid_percent.empty:
+        st.warning(
+            "Validasi distribusi CPMK menemukan total persentase yang tidak tepat 100% pada: "
+            + ", ".join(invalid_percent.index.astype(str).tolist())
+        )
 
     fig = px.bar(
         grouped,
         x="Kode CPL",
         y="Persentase Komposisi CPMK (%)",
-        color="Kriteria",
+        color="Kriteria CPMK",
         text=grouped["Persentase Komposisi CPMK (%)"].round(1),
         color_discrete_map=ACHIEVEMENT_COLORS,
-        category_orders={"Kriteria": category_order},
+        category_orders={"Kriteria CPMK": category_order, "Kode CPL": CPL_RADAR_CODES},
         title="Distribusi Ketercapaian CPMK berdasarkan CPL",
     )
     fig.update_traces(texttemplate="%{text:.1f}%", textposition="inside")
@@ -4035,7 +4068,7 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
 
     pivot = grouped.pivot_table(
         index="Kode CPL",
-        columns="Kriteria",
+        columns="Kriteria CPMK",
         values="Jumlah CPMK",
         aggfunc="sum",
         fill_value=0,

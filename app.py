@@ -221,6 +221,9 @@ COLUMN_ALIASES = {
     "notasi ik": "Notasi IK",
     "tahun akademik": "Tahun Akademik",
     "semester": "Semester",
+    "semester akademik": "Semester Akademik",
+    "semester kurikulum": "Semester Kurikulum",
+    "angkatan": "Angkatan",
     "kelas": "Kelas",
     "kode mk": "Kode MK",
     "mata kuliah": "Mata Kuliah",
@@ -1416,7 +1419,18 @@ def calculate_rekap_cpmk(
     nilai_valid["Tercapai"] = nilai_valid["Nilai_Bersih"] > CPL_STUDENT_ACHIEVEMENT_THRESHOLD
     group_keys = [
         column
-        for column in ["Tahun Akademik", "Semester", "Kode MK", "Mata Kuliah", "Kode CPMK", "Kode CPL", "Kode IK"]
+        for column in [
+            "Tahun Akademik",
+            "Semester Akademik",
+            "Semester",
+            "Semester Kurikulum",
+            "Angkatan",
+            "Kode MK",
+            "Mata Kuliah",
+            "Kode CPMK",
+            "Kode CPL",
+            "Kode IK",
+        ]
         if column in nilai_valid.columns
     ]
     if not group_keys:
@@ -2520,6 +2534,17 @@ def render_filter_controls(data: Dict[str, pd.DataFrame], key_prefix: str) -> Di
         "Tahun Akademik": st.multiselect(
             "Tahun Akademik", unique_filter_options(data, "Tahun Akademik"), key=f"{key_prefix}_filter_tahun"
         ),
+        "Semester Akademik": st.multiselect(
+            "Semester Akademik",
+            unique_filter_options(data, "Semester Akademik"),
+            key=f"{key_prefix}_filter_semester_akademik",
+        ),
+        "Semester Kurikulum": [],
+        "Angkatan": st.multiselect(
+            "Angkatan",
+            unique_filter_options(data, "Angkatan"),
+            key=f"{key_prefix}_filter_angkatan",
+        ),
         "Semester": st.multiselect(
             "Semester", unique_filter_options(data, "Semester"), key=f"{key_prefix}_filter_semester"
         ),
@@ -2537,15 +2562,45 @@ def render_filter_controls(data: Dict[str, pd.DataFrame], key_prefix: str) -> Di
     filters["Komponen"] = st.multiselect(
         "Komponen Asesmen", component_options, key=f"{key_prefix}_filter_component"
     )
+    semester_kurikulum_options = [
+        "Semua Semester",
+        "Semester 1",
+        "Semester 2",
+        "Semester 3",
+        "Semester 4",
+        "Semester 5",
+        "Semester 6",
+    ]
+    available_semester_kurikulum = unique_filter_options(data, "Semester Kurikulum")
+    if available_semester_kurikulum:
+        selected_semester_kurikulum = st.selectbox(
+            "Semester Kurikulum",
+            semester_kurikulum_options,
+            key=f"{key_prefix}_filter_semester_kurikulum",
+        )
+        if selected_semester_kurikulum != "Semua Semester":
+            filters["Semester Kurikulum"] = [selected_semester_kurikulum]
     return filters
 
 
 def filter_frame(df: pd.DataFrame, filters: Dict[str, List[str]], component_column: Optional[str] = None) -> pd.DataFrame:
     filtered = df.copy()
-    for column in ["Tahun Akademik", "Semester", "Mata Kuliah", "Kode CPL", "Kode IK"]:
+    for column in [
+        "Tahun Akademik",
+        "Semester Akademik",
+        "Semester",
+        "Semester Kurikulum",
+        "Angkatan",
+        "Mata Kuliah",
+        "Kode CPL",
+        "Kode IK",
+    ]:
         selected = filters.get(column, [])
         if selected and column in filtered.columns:
-            filtered = filtered[filtered[column].astype(str).isin(selected)]
+            if column == "Semester Kurikulum":
+                filtered = filtered[semester_kurikulum_matches(filtered[column], selected)]
+            else:
+                filtered = filtered[filtered[column].astype(str).isin(selected)]
     selected_components = filters.get("Komponen", [])
     if selected_components and component_column and component_column in filtered.columns:
         filtered = filtered[filtered[component_column].astype(str).isin(selected_components)]
@@ -2585,25 +2640,34 @@ def load_default_sample() -> Optional[Dict[str, pd.DataFrame]]:
 
 
 def render_download_buttons_single(
-    rekap_cpmk: pd.DataFrame, rekap_ik: pd.DataFrame, rekap_cpl: pd.DataFrame, cqi: pd.DataFrame
+    rekap_cpmk: pd.DataFrame,
+    rekap_ik: pd.DataFrame,
+    rekap_cpl: pd.DataFrame,
+    cqi: pd.DataFrame,
+    filters: Optional[Dict[str, List[str]]] = None,
 ) -> None:
     st.subheader("Download Laporan")
     col1, col2, col3, col4, col5 = st.columns(5)
     downloads = [
-        (col1, "Rekap CPMK", "Rekap_CPMK.xlsx", {"Rekap_CPMK": rekap_cpmk}),
-        (col2, "Rekap IK", "Rekap_IK.xlsx", {"Rekap_IK": rekap_ik}),
-        (col3, "Rekap CPL", "Rekap_CPL.xlsx", {"Rekap_CPL": rekap_cpl}),
-        (col4, "Laporan CQI", "Laporan_CQI.xlsx", {"Laporan_CQI": cqi}),
+        (col1, "Rekap CPMK", "Rekap_CPMK.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPMK": rekap_cpmk}),
+        (col2, "Rekap IK", "Rekap_IK.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_IK": rekap_ik}),
+        (col3, "Rekap CPL", "Rekap_CPL.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPL": rekap_cpl}),
+        (col4, "Laporan CQI", "Laporan_CQI.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Laporan_CQI": cqi}),
         (
             col5,
             "Semua Rekap",
             "Semua_Rekap_Asesmen_CPL.xlsx",
             {
+                "Filter_Aktif": filter_info_dataframe(filters or {}),
                 "Rekap_CPMK": rekap_cpmk,
-                "Tren_CPMK": prepare_trend_cpmk(rekap_cpmk),
+                "Tren_CPMK": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk)),
                 "Rekap_IK": rekap_ik,
                 "Rekap_CPL": rekap_cpl,
                 "Laporan_CQI": cqi,
+                "Rekap_CPMK_Filtered": rekap_cpmk,
+                "Rekap_IK_Filtered": rekap_ik,
+                "Rekap_CPL_Filtered": rekap_cpl,
+                "Tren_CPMK_Filtered": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk)),
             },
         ),
     ]
@@ -2626,6 +2690,7 @@ def render_download_buttons_multi(
     trend_ik: pd.DataFrame,
     cqi_all: pd.DataFrame,
     evaluasi_cqi: pd.DataFrame,
+    filters: Optional[Dict[str, List[str]]] = None,
 ) -> None:
     st.subheader("Download Multi Semester")
     col1, col2, col3, col4 = st.columns(4)
@@ -2638,6 +2703,7 @@ def render_download_buttons_multi(
             "Semua Rekap Multi",
             "Semua_Rekap_Multi_Semester.xlsx",
             {
+                "Filter_Aktif": filter_info_dataframe(filters or {}),
                 "Rekap_CPMK_All": rekap_cpmk_all,
                 "Rekap_CPMK_Gabungan": aggregate_rekap_cpmk_multi(rekap_cpmk_all),
                 "Tren_CPMK": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk_all)),
@@ -2648,6 +2714,10 @@ def render_download_buttons_multi(
                 "Tren_IK": trend_ik,
                 "CQI_All": cqi_all,
                 "Evaluasi_CQI": evaluasi_cqi,
+                "Rekap_CPMK_Filtered": rekap_cpmk_all,
+                "Rekap_IK_Filtered": rekap_ik_all,
+                "Rekap_CPL_Filtered": rekap_cpl_all,
+                "Tren_CPMK_Filtered": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk_all)),
             },
         ),
     ]
@@ -3006,13 +3076,14 @@ def render_single_mode() -> None:
         render_sidebar_system_info("Single Semester")
 
     filtered_data = apply_workbook_filters(raw_data, filters)
+    render_active_filter_context(filters)
     result = calculate_all(filtered_data, batas_nilai, target_cpl)
     rekap_cpmk = result["rekap_cpmk"]
     rekap_ik = result["rekap_ik"]
     rekap_cpl = result["rekap_cpl"]
     cqi = result["cqi"]
 
-    render_download_buttons_single(rekap_cpmk, rekap_ik, rekap_cpl, cqi)
+    render_download_buttons_single(rekap_cpmk, rekap_ik, rekap_cpl, cqi, filters)
 
     rekap_cpl_period = add_period_columns(rekap_cpl, "Single Semester", "-", "-")
     rekap_ik_period = add_period_columns(rekap_ik, "Single Semester", "-", "-")
@@ -3235,6 +3306,7 @@ def render_multi_mode() -> None:
     cqi_all_raw = filter_frame(cqi_all_raw, multi_filters)
     if not detail_asesmen_all.empty:
         detail_asesmen_all = filter_frame(detail_asesmen_all, multi_filters, "Komponen")
+    render_active_filter_context(multi_filters)
 
     selected_period_count = (
         rekap_cpmk_all["Periode"].dropna().astype(str).nunique()
@@ -3261,6 +3333,7 @@ def render_multi_mode() -> None:
         trend_ik,
         cqi_all,
         evaluasi_cqi,
+        multi_filters,
     )
 
     tab_names = [
@@ -3758,6 +3831,45 @@ def cpmk_sort_key(code):
     major = int(match.group(1))
     minor = int(match.group(2)) if match.group(2) else 0
     return (major, minor)
+
+
+def semester_kurikulum_label(value: object) -> str:
+    text = str(value).strip()
+    match = re.search(r"(\d+)", text)
+    if not match:
+        return text
+    return f"Semester {int(match.group(1))}"
+
+
+def semester_kurikulum_matches(series: pd.Series, selected: List[str]) -> pd.Series:
+    selected_labels = {semester_kurikulum_label(value) for value in selected}
+    return series.map(semester_kurikulum_label).isin(selected_labels)
+
+
+def filter_info_dataframe(filters: Dict[str, List[str]]) -> pd.DataFrame:
+    rows = []
+    for column in ["Tahun Akademik", "Semester Akademik", "Semester Kurikulum", "Angkatan"]:
+        selected = filters.get(column, [])
+        rows.append(
+            {
+                "Filter": column,
+                "Nilai": ", ".join(selected) if selected else "Semua",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_active_filter_context(filters: Dict[str, List[str]]) -> None:
+    semester = filters.get("Semester Kurikulum", [])
+    semester_text = semester[0] if semester else "Semua Semester"
+    details = filter_info_dataframe(filters)
+    extra = []
+    for column in ["Tahun Akademik", "Semester Akademik", "Angkatan"]:
+        selected = filters.get(column, [])
+        if selected:
+            extra.append(f"{column}: {', '.join(selected)}")
+    suffix = " | " + " | ".join(extra) if extra else ""
+    st.info(f"Data yang ditampilkan: {semester_text}{suffix}")
 
 
 def _final_cpl_master(master_cpl: pd.DataFrame) -> pd.DataFrame:
@@ -4300,7 +4412,29 @@ def aggregate_rekap_cpmk_multi(rekap_cpmk: pd.DataFrame) -> pd.DataFrame:
 
 
 def render_trend_cpmk(rekap_cpmk: pd.DataFrame) -> None:
-    trend = prepare_trend_cpmk(rekap_cpmk)
+    source = rekap_cpmk.copy() if rekap_cpmk is not None else pd.DataFrame()
+    if "Semester Kurikulum" in source.columns and source["Semester Kurikulum"].astype(str).str.strip().ne("").any():
+        semester_labels = sorted(
+            {semester_kurikulum_label(value) for value in source["Semester Kurikulum"].dropna()},
+            key=lambda value: int(re.search(r"(\d+)", value).group(1)) if re.search(r"(\d+)", value) else 999,
+        )
+        if len(semester_labels) > 1:
+            scope = st.radio(
+                "Cakupan Tren CPMK",
+                ["Tampilkan semua CPMK kumulatif", "Tampilkan CPMK semester terpilih"],
+                horizontal=True,
+                key="trend_cpmk_scope",
+            )
+            if scope == "Tampilkan CPMK semester terpilih":
+                selected_semester = st.selectbox(
+                    "Semester Kurikulum",
+                    semester_labels,
+                    key="trend_cpmk_semester_kurikulum_scope",
+                )
+                source = source[semester_kurikulum_matches(source["Semester Kurikulum"], [selected_semester])]
+            else:
+                source = aggregate_rekap_cpmk_multi(source)
+    trend = prepare_trend_cpmk(source)
     if trend.empty:
         st.info("Belum ada data CPMK valid untuk ditampilkan.")
         return

@@ -1732,6 +1732,12 @@ def build_student_cpl_detail(
         )
 
     values = student_rows[["Kode CPL Radar", "Nilai CPL"]].copy()
+    values["Nilai CPL"] = pd.to_numeric(values["Nilai CPL"], errors="coerce")
+    values = (
+        values.dropna(subset=["Kode CPL Radar"])
+        .groupby("Kode CPL Radar", as_index=False, dropna=False)
+        .agg(**{"Nilai CPL": ("Nilai CPL", "mean")})
+    )
     detail = rumusan_lookup.merge(values, on="Kode CPL Radar", how="left")
     detail["Has Data"] = detail["Nilai CPL"].notna()
     detail["Nilai CPL"] = detail["Nilai CPL"].fillna(0).clip(0, 100)
@@ -4116,35 +4122,73 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
         ],
     )
     if value_col is None:
-        st.warning("Data Tren IK belum memiliki kolom persentase CPMK/IK.")
+        st.warning("Data Tren IK belum memiliki kolom Capaian CPMK atau Rata-rata Nilai.")
         return
     filtered[value_col] = pd.to_numeric(filtered[value_col], errors="coerce").fillna(0).clip(0, 100)
-    filtered["Kriteria"] = filtered[value_col].apply(classify_achievement)
-    cpmk_col = "Kode CPMK" if "Kode CPMK" in filtered.columns else None
-    if cpmk_col:
-        filtered = filtered.drop_duplicates(["Kode CPL", "Kode IK", cpmk_col])
-    filtered = filtered.sort_values("Kode IK", key=lambda values: values.map(sort_ik_key))
+    weight_col = pick_existing_column(filtered, ["Bobot_CPMK_Bersih", "Bobot CPMK"])
+    if weight_col:
+        filtered["_Bobot_CPMK_Agregat"] = clean_weight_series(filtered[weight_col])
+    else:
+        filtered["_Bobot_CPMK_Agregat"] = 1.0
+    filtered["_Bobot_CPMK_Agregat"] = pd.to_numeric(
+        filtered["_Bobot_CPMK_Agregat"], errors="coerce"
+    ).fillna(1)
+    filtered["_Bobot_CPMK_Agregat"] = filtered["_Bobot_CPMK_Agregat"].where(
+        filtered["_Bobot_CPMK_Agregat"] > 0, 1
+    )
+
+    cpmk_rows = []
+    for (kode_ik, kode_cpmk), group in filtered.groupby(["Kode IK", "Kode CPMK"], dropna=False):
+        scores = pd.to_numeric(group[value_col], errors="coerce").fillna(0).clip(0, 100)
+        weights = pd.to_numeric(group["_Bobot_CPMK_Agregat"], errors="coerce").fillna(1)
+        weights = weights.where(weights > 0, 1)
+        if weights.sum() > 0:
+            cpmk_score = float((scores * weights).sum() / weights.sum())
+        else:
+            cpmk_score = float(scores.mean()) if len(scores) else 0.0
+        cpmk_rows.append(
+            {
+                "Kode IK": kode_ik,
+                "Kode CPMK": kode_cpmk,
+                "Capaian CPMK Agregat": max(0.0, min(100.0, cpmk_score)),
+            }
+        )
+
+    cpmk_by_ik_df = pd.DataFrame(cpmk_rows)
+    if cpmk_by_ik_df.empty:
+        st.info("Tidak ada CPMK agregat yang dapat dihitung untuk Tren IK.")
+        return
+    cpmk_by_ik_df["Kriteria CPMK"] = cpmk_by_ik_df["Capaian CPMK Agregat"].apply(classify_achievement)
+    cpmk_by_ik_df["_sort_ik"] = cpmk_by_ik_df["Kode IK"].map(sort_ik_key)
+    cpmk_by_ik_df = cpmk_by_ik_df.sort_values(["_sort_ik", "Kode CPMK"]).drop(columns=["_sort_ik"])
 
     category_order = ["Sangat Kurang", "Kurang", "Cukup", "Baik", "Sangat Baik"]
     grouped = (
-        filtered.groupby(["Kode IK", "Kriteria"], dropna=False)
+        cpmk_by_ik_df.groupby(["Kode IK", "Kriteria CPMK"], dropna=False)
         .size()
         .reset_index(name="Jumlah CPMK")
     )
     totals = grouped.groupby("Kode IK")["Jumlah CPMK"].transform("sum").replace(0, pd.NA)
     grouped["Persentase Komposisi CPMK (%)"] = (grouped["Jumlah CPMK"] / totals * 100).fillna(0).clip(0, 100)
-    grouped["Kriteria"] = pd.Categorical(grouped["Kriteria"], categories=category_order, ordered=True)
+    grouped["Kriteria CPMK"] = pd.Categorical(grouped["Kriteria CPMK"], categories=category_order, ordered=True)
     grouped["_sort_ik"] = grouped["Kode IK"].map(sort_ik_key)
-    grouped = grouped.sort_values(["_sort_ik", "Kriteria"])
+    grouped = grouped.sort_values(["_sort_ik", "Kriteria CPMK"])
+    percent_check = grouped.groupby("Kode IK")["Persentase Komposisi CPMK (%)"].sum().round(2)
+    invalid_percent = percent_check[(percent_check - 100).abs() > 0.05]
+    if not invalid_percent.empty:
+        st.warning(
+            "Validasi distribusi CPMK menemukan total persentase yang tidak tepat 100% pada IK: "
+            + ", ".join(invalid_percent.index.astype(str).tolist())
+        )
 
     fig = px.bar(
         grouped.drop(columns=["_sort_ik"]),
         x="Kode IK",
         y="Persentase Komposisi CPMK (%)",
-        color="Kriteria",
+        color="Kriteria CPMK",
         text=grouped["Persentase Komposisi CPMK (%)"].round(1),
         color_discrete_map=ACHIEVEMENT_COLORS,
-        category_orders={"Kriteria": category_order},
+        category_orders={"Kriteria CPMK": category_order},
         title=f"Distribusi Ketercapaian CPMK berdasarkan IK pada {selected_cpl}",
     )
     fig.update_traces(texttemplate="%{text:.1f}%", textposition="inside")
@@ -4154,7 +4198,7 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
 
     pivot = grouped.pivot_table(
         index="Kode IK",
-        columns="Kriteria",
+        columns="Kriteria CPMK",
         values="Jumlah CPMK",
         aggfunc="sum",
         fill_value=0,

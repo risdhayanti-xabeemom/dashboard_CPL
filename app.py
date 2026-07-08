@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -137,6 +138,54 @@ OPTIONAL_SHEETS = {
         "Mata Kuliah Baru",
         "Status Konversi",
         "Keterangan",
+    ],
+    "Ketentuan_Nilai_Huruf": [],
+}
+
+SHEET_COLUMN_LIMITS = {
+    "Nilai_CPMK": [
+        "NIM",
+        "Nama Mahasiswa",
+        "Angkatan",
+        "Tahun Akademik",
+        "Semester Akademik",
+        "Periode",
+        "Semester",
+        "Semester Kurikulum",
+        "Kode MK",
+        "Mata Kuliah",
+        "Kode CPL",
+        "Kode IK",
+        "Notasi IK",
+        "Kode CPMK",
+        "Nilai",
+        "Nilai Huruf",
+        "Huruf Asli",
+        "Status",
+        "Bobot CPMK",
+        "Bobot Komponen",
+        "Komponen",
+        "Komponen Asesmen",
+        "Label Jadwal Asesmen",
+    ],
+    "Mapping_CPMK": [
+        "Tahun Akademik",
+        "Semester Akademik",
+        "Periode",
+        "Semester",
+        "Semester Kurikulum",
+        "Angkatan",
+        "Kode MK",
+        "Mata Kuliah",
+        "Kode CPMK",
+        "Rumusan CPMK",
+        "Kode CPL",
+        "Kode IK",
+        "Notasi IK",
+        "Bobot CPMK",
+        "Komponen Asesmen",
+        "Komponen",
+        "Bobot Komponen",
     ],
 }
 
@@ -538,6 +587,57 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned.dropna(how="all")
 
 
+def limit_sheet_columns(sheet_name: str, df: pd.DataFrame) -> pd.DataFrame:
+    needed = SHEET_COLUMN_LIMITS.get(sheet_name)
+    if not needed or df is None or df.empty:
+        return df
+    available = [column for column in needed if column in df.columns]
+    extra_columns = [
+        column
+        for column in df.columns
+        if str(column).endswith("_Asli") or str(column).startswith("_")
+    ]
+    selected = list(dict.fromkeys(available + extra_columns))
+    return df[selected].copy() if selected else df
+
+
+def optimize_sheet_types(sheet_name: str, df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    optimized = df.copy()
+    text_columns = [
+        "NIM",
+        "Nama Mahasiswa",
+        "Kode MK",
+        "Mata Kuliah",
+        "Kode CPL",
+        "Kode IK",
+        "Notasi IK",
+        "Kode CPMK",
+        "Tahun Akademik",
+        "Semester Akademik",
+        "Periode",
+        "Semester",
+        "Semester Kurikulum",
+        "Angkatan",
+        "Komponen",
+        "Komponen Asesmen",
+        "Nilai Huruf",
+        "Huruf Asli",
+    ]
+    for column in text_columns:
+        if column in optimized.columns:
+            optimized[column] = optimized[column].astype("string")
+    for column in ["Nilai", "Bobot CPMK", "Bobot Komponen"]:
+        if column in optimized.columns:
+            optimized[column] = pd.to_numeric(optimized[column], errors="coerce")
+    return optimized
+
+
+def finalize_loaded_sheet(sheet_name: str, df: pd.DataFrame) -> pd.DataFrame:
+    return optimize_sheet_types(sheet_name, limit_sheet_columns(sheet_name, df))
+
+
 def read_sheet_auto_header(file_obj, sheet_name: str, required_cols: List[str]) -> pd.DataFrame:
     preview = pd.read_excel(file_obj, sheet_name=sheet_name, header=None, nrows=5, engine="openpyxl")
     required = {canonical_column_name(column) for column in required_cols}
@@ -549,7 +649,7 @@ def read_sheet_auto_header(file_obj, sheet_name: str, required_cols: List[str]) 
         }
         if required.issubset(detected):
             sheet = pd.read_excel(file_obj, sheet_name=sheet_name, header=row_index, engine="openpyxl")
-            return clean_dataframe(sheet)
+            return finalize_loaded_sheet(str(sheet_name).strip(), clean_dataframe(sheet))
 
     raise ValueError(
         f"Sheet '{sheet_name}' tidak menemukan baris header pada 5 baris pertama. "
@@ -558,10 +658,18 @@ def read_sheet_auto_header(file_obj, sheet_name: str, required_cols: List[str]) 
 
 
 def read_optional_sheet_auto_header(file_obj, sheet_name: str, required_cols: List[str]) -> pd.DataFrame:
+    if not required_cols:
+        return finalize_loaded_sheet(
+            str(sheet_name).strip(),
+            clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl")),
+        )
     try:
         return read_sheet_auto_header(file_obj, sheet_name, required_cols)
     except ValueError:
-        return clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl"))
+        return finalize_loaded_sheet(
+            str(sheet_name).strip(),
+            clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl")),
+        )
 
 
 def read_workbook(file_obj) -> Dict[str, pd.DataFrame]:
@@ -586,9 +694,7 @@ def read_workbook(file_obj) -> Dict[str, pd.DataFrame]:
                 workbook, original_name, INPUT_NORMALISASI_REQUIRED
             )
         elif normalized_name in {"GANJIL", "GENAP"}:
-            cleaned[normalized_name] = read_any_sheet(workbook, original_name)
-        else:
-            cleaned[normalized_name] = clean_dataframe(pd.read_excel(workbook, sheet_name=original_name, engine="openpyxl"))
+            continue
 
     if all(sheet in cleaned for sheet in REQUIRED_SHEETS):
         messages.append("Format dashboard-ready terdeteksi.")
@@ -626,8 +732,93 @@ def read_workbook(file_obj) -> Dict[str, pd.DataFrame]:
     return normalize_input_workbook(cleaned)
 
 
+@st.cache_data(show_spinner="Membaca file Excel...")
+def read_workbook_cached(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
+    buffer = BytesIO(file_bytes)
+    return read_workbook(buffer)
+
+
+def hash_file_bytes(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def filters_cache_key(filters: Optional[Dict[str, List[str]]]) -> str:
+    if not filters:
+        return ""
+    parts = []
+    for key in sorted(filters):
+        value = filters.get(key, [])
+        if isinstance(value, (list, tuple, set)):
+            value_text = ",".join(sorted(str(item) for item in value))
+        else:
+            value_text = str(value)
+        parts.append(f"{key}={value_text}")
+    return "|".join(parts)
+
+
+def dataframe_light_signature(df: pd.DataFrame) -> str:
+    if df is None:
+        return "none"
+    pieces = [str(df.shape), ",".join(map(str, df.columns))]
+    if not df.empty:
+        sample = pd.concat([df.head(3), df.tail(3)]).drop_duplicates()
+        pieces.append(str(pd.util.hash_pandas_object(sample.astype(str), index=True).sum()))
+    return ":".join(pieces)
+
+
+def data_cache_signature(data: Dict[str, pd.DataFrame]) -> str:
+    if not data:
+        return "empty"
+    parts = []
+    for sheet in sorted(data):
+        frame = data[sheet]
+        if isinstance(frame, pd.DataFrame):
+            parts.append(f"{sheet}:{dataframe_light_signature(frame)}")
+    return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()
+
+
+@st.cache_data(show_spinner="Menghitung capaian CPL, IK, dan CPMK...")
+def calculate_all_cached(_data: Dict[str, pd.DataFrame], batas_nilai: float, target_cpl: float, cache_key: str):
+    return calculate_all(_data, batas_nilai, target_cpl)
+
+
+@st.cache_data(show_spinner="Menghitung capaian periode...")
+def calculate_period_result_cached(period_label: str, _data: Dict[str, pd.DataFrame], cache_key: str):
+    return calculate_period_result(period_label, _data)
+
+
+def workbook_data_summary(data: Dict[str, pd.DataFrame]) -> Dict[str, int]:
+    nilai = data.get("Nilai_CPMK", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    master_cpl = data.get("Master_CPL", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    nim_count = 0
+    cpmk_count = 0
+    if isinstance(nilai, pd.DataFrame) and not nilai.empty:
+        nim_count = count_unique_students(nilai)
+        if "Kode CPMK" in nilai.columns:
+            cpmk_count = int(nilai["Kode CPMK"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
+    cpl_count = 0
+    if isinstance(master_cpl, pd.DataFrame) and "Kode CPL" in master_cpl.columns:
+        cpl_count = int(master_cpl["Kode CPL"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
+    return {
+        "Jumlah baris Nilai_CPMK": int(len(nilai)) if isinstance(nilai, pd.DataFrame) else 0,
+        "Jumlah mahasiswa unik": nim_count,
+        "Jumlah CPMK": cpmk_count,
+        "Jumlah CPL": cpl_count,
+    }
+
+
+def render_workbook_summary(data: Dict[str, pd.DataFrame]) -> None:
+    summary = workbook_data_summary(data)
+    st.caption(
+        " | ".join(f"{label}: {value:,}".replace(",", ".") for label, value in summary.items())
+    )
+
+
 def read_any_sheet(file_obj, sheet_name: str) -> pd.DataFrame:
-    return clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl"))
+    return finalize_loaded_sheet(
+        str(sheet_name).strip(),
+        clean_dataframe(pd.read_excel(file_obj, sheet_name=sheet_name, engine="openpyxl")),
+    )
 
 
 def normalize_mk_equivalency_sheet(equivalency: pd.DataFrame) -> pd.DataFrame:
@@ -2873,6 +3064,23 @@ def load_default_sample() -> Optional[Dict[str, pd.DataFrame]]:
         return None
 
 
+def render_lazy_download_button(col, label: str, filename: str, sheets, key: str) -> None:
+    with col:
+        if st.button(f"Siapkan {label}", key=f"prepare_{key}", use_container_width=True):
+            with st.spinner(f"Menyiapkan {filename}..."):
+                prepared_sheets = sheets() if callable(sheets) else sheets
+                st.session_state[f"download_{key}"] = dataframe_to_excel(prepared_sheets)
+        if f"download_{key}" in st.session_state:
+            st.download_button(
+                label,
+                data=st.session_state[f"download_{key}"],
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_button_{key}",
+            )
+
+
 def render_download_buttons_single(
     rekap_cpmk: pd.DataFrame,
     rekap_ik: pd.DataFrame,
@@ -2881,8 +3089,11 @@ def render_download_buttons_single(
     filters: Optional[Dict[str, List[str]]] = None,
     evaluasi_cqi: Optional[pd.DataFrame] = None,
     evaluasi_mk: Optional[pd.DataFrame] = None,
+    fast_mode: bool = False,
 ) -> None:
     st.subheader("Download Laporan")
+    if fast_mode:
+        st.caption("Mode cepat aktif: file Excel export baru dibuat setelah tombol Siapkan ditekan.")
     col1, col2, col3, col4, col5 = st.columns(5)
     downloads = [
         (col1, "Rekap CPMK", "Rekap_CPMK.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPMK": rekap_cpmk}),
@@ -2903,7 +3114,7 @@ def render_download_buttons_single(
             col5,
             "Semua Rekap",
             "Semua_Rekap_Asesmen_CPL.xlsx",
-            {
+            lambda: {
                 "Filter_Aktif": filter_info_dataframe(filters or {}),
                 "Rekap_CPMK": rekap_cpmk,
                 "Tren_CPMK": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk)),
@@ -2919,15 +3130,9 @@ def render_download_buttons_single(
             },
         ),
     ]
-    for col, label, filename, sheets in downloads:
-        with col:
-            st.download_button(
-                label,
-                data=dataframe_to_excel(sheets),
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+    export_key = hashlib.sha1(filters_cache_key(filters or {}).encode("utf-8")).hexdigest()[:10]
+    for index, (col, label, filename, sheets) in enumerate(downloads):
+        render_lazy_download_button(col, label, filename, sheets, f"single_{index}_{export_key}_{filename}")
 
 
 def render_download_buttons_multi(
@@ -2940,8 +3145,11 @@ def render_download_buttons_multi(
     evaluasi_cqi: pd.DataFrame,
     filters: Optional[Dict[str, List[str]]] = None,
     evaluasi_mk: Optional[pd.DataFrame] = None,
+    fast_mode: bool = False,
 ) -> None:
     st.subheader("Download Multi Semester")
+    if fast_mode:
+        st.caption("Mode cepat aktif: file Excel export baru dibuat setelah tombol Siapkan ditekan.")
     col1, col2, col3, col4 = st.columns(4)
     downloads = [
         (col1, "Tren CPL", "Tren_CPL.xlsx", {"Tren_CPL": trend_cpl}),
@@ -2959,7 +3167,7 @@ def render_download_buttons_multi(
             col4,
             "Semua Rekap Multi",
             "Semua_Rekap_Multi_Semester.xlsx",
-            {
+            lambda: {
                 "Filter_Aktif": filter_info_dataframe(filters or {}),
                 "Rekap_CPMK_All": rekap_cpmk_all,
                 "Rekap_CPMK_Gabungan": aggregate_rekap_cpmk_multi(rekap_cpmk_all),
@@ -2979,15 +3187,9 @@ def render_download_buttons_multi(
             },
         ),
     ]
-    for col, label, filename, sheets in downloads:
-        with col:
-            st.download_button(
-                label,
-                data=dataframe_to_excel(sheets),
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+    export_key = hashlib.sha1(filters_cache_key(filters or {}).encode("utf-8")).hexdigest()[:10]
+    for index, (col, label, filename, sheets) in enumerate(downloads):
+        render_lazy_download_button(col, label, filename, sheets, f"multi_{index}_{export_key}_{filename}")
 
 
 def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
@@ -3263,10 +3465,14 @@ def render_single_mode() -> None:
     with st.sidebar:
         sidebar_section("Upload Data")
         uploaded_file = st.file_uploader("Upload file Excel", type=["xlsx"], key="single_upload")
+        fast_mode = st.checkbox("Mode cepat", value=True, key="single_fast_mode")
 
+    raw_file_hash = ""
     if uploaded_file is not None:
         try:
-            raw_data = read_workbook(uploaded_file)
+            file_bytes = uploaded_file.getvalue()
+            raw_file_hash = hash_file_bytes(file_bytes)
+            raw_data = read_workbook_cached(file_bytes)
         except ValueError as exc:
             st.error("File Excel belum sesuai.")
             st.write(str(exc))
@@ -3287,6 +3493,7 @@ def render_single_mode() -> None:
         )
         render_guide()
         return
+    render_workbook_summary(raw_data)
 
     validation_errors = validate_workbook(raw_data)
     if validation_errors:
@@ -3343,7 +3550,15 @@ def render_single_mode() -> None:
     filtered_data = apply_workbook_filters(raw_data_global, filters)
     export_filters = {**filters, **global_filters}
     render_active_filter_context(global_filters)
-    result = calculate_all(filtered_data, batas_nilai, target_cpl)
+    calculate_key = "|".join(
+        [
+            raw_file_hash or data_cache_signature(filtered_data),
+            filters_cache_key(export_filters),
+            str(float(batas_nilai)),
+            str(float(target_cpl)),
+        ]
+    )
+    result = calculate_all_cached(filtered_data, float(batas_nilai), float(target_cpl), calculate_key)
     rekap_cpmk = result["rekap_cpmk"]
     rekap_ik = result["rekap_ik"]
     rekap_cpl = result["rekap_cpl"]
@@ -3367,6 +3582,7 @@ def render_single_mode() -> None:
         export_filters,
         evaluasi_cqi=evaluasi_cqi,
         evaluasi_mk=evaluasi_mk,
+        fast_mode=fast_mode,
     )
 
     tab_names = [
@@ -3422,6 +3638,9 @@ def render_period_manager() -> None:
     init_period_state()
     with st.sidebar:
         sidebar_section("Upload Data")
+        st.session_state.multi_fast_mode = st.checkbox(
+            "Mode cepat", value=st.session_state.get("multi_fast_mode", True), key="multi_fast_mode_checkbox"
+        )
         period_label = st.text_input("Nama Periode/Semester", placeholder="Contoh: 2025 Ganjil")
         uploaded_file = st.file_uploader("Upload file Excel periode ini", type=["xlsx"], key="multi_upload")
         if st.button("Tambah Periode", use_container_width=True):
@@ -3478,9 +3697,7 @@ def render_multi_mode() -> None:
     for item in uploads:
         periode = item["periode"]
         try:
-            uploaded_file = BytesIO(item["content"])
-            uploaded_file.seek(0)
-            period_data = read_workbook(uploaded_file)
+            period_data = read_workbook_cached(item["content"])
 
             master_cpl = period_data["Master_CPL"].copy()
             master_ik = period_data["Master_IK"].copy()
@@ -3516,6 +3733,7 @@ def render_multi_mode() -> None:
         return
 
     combined_nilai_cpmk = pd.concat(nilai_frames, ignore_index=True)
+    render_workbook_summary({**base_data, "Nilai_CPMK": combined_nilai_cpmk})
     try:
         global_filter_data, global_filters = render_global_filters(
             {"Nilai_CPMK": combined_nilai_cpmk}, "multi_global"
@@ -3532,7 +3750,15 @@ def render_multi_mode() -> None:
         period_data = {sheet: frame.copy() for sheet, frame in base_data.items()}
         period_data["Nilai_CPMK"] = period_nilai
         try:
-            period_results.append(calculate_period_result(periode, period_data))
+            period_key = "|".join(
+                [
+                    hash_file_bytes(item["content"]),
+                    str(periode),
+                    filters_cache_key(global_filters),
+                    data_cache_signature({"Nilai_CPMK": period_nilai}),
+                ]
+            )
+            period_results.append(calculate_period_result_cached(periode, period_data, period_key))
         except Exception as exc:  # pragma: no cover - shown to Streamlit users
             validation_errors.append(f"{periode}: {exc}")
 
@@ -3618,6 +3844,7 @@ def render_multi_mode() -> None:
         evaluasi_cqi,
         export_filters,
         evaluasi_mk=evaluasi_mk,
+        fast_mode=st.session_state.get("multi_fast_mode", True),
     )
 
     tab_names = [

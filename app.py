@@ -2330,40 +2330,88 @@ def add_cqi_tracking(cqi_all: pd.DataFrame, rekap_cpl_all: pd.DataFrame, period_
         next_period = get_next_period(period_order, current_period)
         next_value = None
         change = None
+        next_valid = False
         if next_period:
             match = rekap_cpl_all[
                 (rekap_cpl_all["Periode"] == next_period)
                 & (rekap_cpl_all["Kode CPL"] == row["Kode CPL"])
             ]
             if not match.empty:
-                next_value = get_cpl_actual_value(match.iloc[0])
-                change = next_value - safe_numeric_value(row.get("Capaian Aktual", 0))
-        effectiveness = effectiveness_label(change)
+                next_row = match.iloc[0]
+                next_valid = cpl_row_has_data(next_row)
+                if next_valid:
+                    next_value = get_cpl_actual_value(next_row)
+        baseline_valid = cpl_row_has_data(row)
+        if baseline_valid and next_valid:
+            change = next_value - safe_numeric_value(row.get("Capaian Aktual", 0))
+            effectiveness = effectiveness_label(change)
+        else:
+            effectiveness = "Belum dapat dievaluasi"
         enriched = row.to_dict()
-        enriched["Capaian Semester Berikutnya"] = round(next_value, 2) if next_value is not None else None
+        enriched["Capaian Semester Berikutnya"] = round(next_value, 2) if next_value is not None else "Belum tersedia"
         enriched["Efektivitas Tindak Lanjut"] = effectiveness
         rows.append(enriched)
     return pd.DataFrame(rows)
+
+
+def row_numeric_value(row: pd.Series, candidates: List[str], default: float = 0.0) -> float:
+    column = pick_existing_column(row, candidates)
+    return get_numeric_from_row(row, column, default, clamp=False) if column else default
+
+
+def cpl_row_has_data(row: pd.Series) -> bool:
+    return row_numeric_value(
+        row,
+        ["Jumlah Mahasiswa", "Jumlah Mahasiswa Mencapai", "Jumlah Mahasiswa Tercapai"],
+        0.0,
+    ) > 0
+
+
+def cpl_export_value(row: Optional[pd.Series]) -> object:
+    if row is None or not cpl_row_has_data(row):
+        return "Belum tersedia"
+    return round(get_cpl_actual_value(row), 2)
+
+
+def cpl_export_status(row: Optional[pd.Series]) -> str:
+    if row is None or not cpl_row_has_data(row):
+        return "Belum tersedia"
+    status_col = pick_existing_column(row, ["Status"])
+    if status_col:
+        status = str(row.get(status_col, "")).strip()
+        if status:
+            return status
+    return classify_status_by_score(get_cpl_actual_value(row))
+
+
+def cpl_validation_note(row: Optional[pd.Series]) -> str:
+    if row is None or not cpl_row_has_data(row):
+        return "Belum terdapat data CPMK pada periode/filter terpilih"
+    return "Data tersedia"
 
 
 def make_cqi_evaluation(
     cqi_all: pd.DataFrame, rekap_cpl_all: pd.DataFrame, period_order: List[str]
 ) -> pd.DataFrame:
     rows = []
+    output_columns = [
+        "Periode Awal",
+        "Periode Berikut",
+        "Kode CPL",
+        "Indikator Lemah",
+        "Capaian Awal",
+        "Status Awal",
+        "Capaian Berikut",
+        "Perubahan",
+        "Efektivitas",
+        "Rekomendasi Lanjutan",
+        "Catatan Validasi Data",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Tercapai",
+        "Keterangan Periode",
+    ]
     if cqi_all.empty:
-        return pd.DataFrame(
-            columns=[
-                "Periode Awal",
-                "Periode Berikut",
-                "Kode CPL",
-                "Indikator Lemah",
-                "Capaian Awal",
-                "Capaian Berikut",
-                "Perubahan",
-                "Efektivitas",
-                "Rekomendasi Lanjutan",
-            ]
-        )
+        return pd.DataFrame(columns=output_columns)
 
     for _, row in cqi_all.iterrows():
         next_period = get_next_period(period_order, row["Periode"])
@@ -2372,31 +2420,49 @@ def make_cqi_evaluation(
         match = rekap_cpl_all[
             (rekap_cpl_all["Periode"] == next_period) & (rekap_cpl_all["Kode CPL"] == row["Kode CPL"])
         ]
-        if match.empty:
-            continue
-        capaian_awal = safe_numeric_value(row.get("Capaian Aktual", 0))
-        capaian_berikut = get_cpl_actual_value(match.iloc[0])
-        change = capaian_berikut - capaian_awal
-        effectiveness = effectiveness_label(change)
+        next_row = match.iloc[0] if not match.empty else None
+        baseline_valid = cpl_row_has_data(row)
+        next_valid = next_row is not None and cpl_row_has_data(next_row)
+        if baseline_valid and next_valid:
+            capaian_awal = safe_numeric_value(row.get("Capaian Aktual", 0))
+            capaian_berikut = get_cpl_actual_value(next_row)
+            change = capaian_berikut - capaian_awal
+            effectiveness = effectiveness_label(change)
+            change_display = round(change, 2)
+        else:
+            capaian_awal = None
+            capaian_berikut = None
+            effectiveness = "Belum dapat dievaluasi"
+            change_display = "-"
+        jumlah = int(row_numeric_value(row, ["Jumlah Mahasiswa"], 0))
+        tercapai = int(row_numeric_value(row, ["Jumlah Mahasiswa Mencapai", "Jumlah Mahasiswa Tercapai"], 0))
+        notes = [cpl_validation_note(row)]
+        if next_row is None:
+            notes.append("Data periode berikutnya belum tersedia")
+        elif not next_valid:
+            notes.append(cpl_validation_note(next_row))
         rows.append(
             {
                 "Periode Awal": row["Periode"],
                 "Periode Berikut": next_period,
                 "Kode CPL": row["Kode CPL"],
                 "Indikator Lemah": row["Indikator Lemah"],
-                "Capaian Awal": round(capaian_awal, 2),
-                "Capaian Berikut": round(capaian_berikut, 2),
-                "Perubahan": round(change, 2),
+                "Capaian Awal": round(capaian_awal, 2) if capaian_awal is not None else "Belum tersedia",
+                "Status Awal": cpl_export_status(row),
+                "Capaian Berikut": round(capaian_berikut, 2) if capaian_berikut is not None else "Belum tersedia",
+                "Perubahan": change_display,
                 "Efektivitas": effectiveness,
                 "Rekomendasi Lanjutan": recommendation_follow_up(effectiveness, row["Kode CPL"]),
+                "Catatan Validasi Data": "; ".join(dict.fromkeys(notes)),
+                "Jumlah Mahasiswa": jumlah,
+                "Jumlah Mahasiswa Tercapai": min(tercapai, jumlah),
+                "Keterangan Periode": f"Perbandingan {row['Periode']} ke {next_period}",
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=output_columns)
 
 
-def append_mk_equivalency_to_evaluation(
-    evaluasi_cqi: pd.DataFrame, validation_frames: List[pd.DataFrame]
-) -> pd.DataFrame:
+def make_mk_equivalency_evaluation(validation_frames: List[pd.DataFrame]) -> pd.DataFrame:
     rows = []
     for validation in validation_frames:
         if validation is None or validation.empty:
@@ -2409,23 +2475,31 @@ def append_mk_equivalency_to_evaluation(
                 continue
             rows.append(
                 {
-                    "Periode Awal": periode,
-                    "Periode Berikut": "-",
-                    "Kode CPL": "MK",
-                    "Indikator Lemah": parameter,
-                    "Capaian Awal": "",
-                    "Capaian Berikut": "",
-                    "Perubahan": "",
-                    "Efektivitas": "Evaluasi Perubahan Kurikulum",
-                    "Rekomendasi Lanjutan": str(value),
+                    "Periode": periode,
+                    "Kategori Evaluasi": "Perubahan MK",
+                    "Parameter": parameter,
+                    "Nilai": str(value),
+                    "Catatan Validasi Data": "Informasi penyetaraan Kode MK lintas kurikulum",
+                    "Keterangan Periode": f"Evaluasi perubahan kurikulum pada {periode}",
                 }
             )
-    if not rows:
-        return evaluasi_cqi
-    mk_eval = pd.DataFrame(rows)
-    if evaluasi_cqi is None or evaluasi_cqi.empty:
-        return mk_eval
-    return pd.concat([evaluasi_cqi, mk_eval], ignore_index=True)
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Periode",
+            "Kategori Evaluasi",
+            "Parameter",
+            "Nilai",
+            "Catatan Validasi Data",
+            "Keterangan Periode",
+        ],
+    )
+
+
+def append_mk_equivalency_to_evaluation(
+    evaluasi_cqi: pd.DataFrame, validation_frames: List[pd.DataFrame]
+) -> pd.DataFrame:
+    return evaluasi_cqi.copy() if evaluasi_cqi is not None else pd.DataFrame()
 
 
 def dataframe_to_excel(sheets: Dict[str, pd.DataFrame]) -> bytes:
@@ -2805,6 +2879,8 @@ def render_download_buttons_single(
     rekap_cpl: pd.DataFrame,
     cqi: pd.DataFrame,
     filters: Optional[Dict[str, List[str]]] = None,
+    evaluasi_cqi: Optional[pd.DataFrame] = None,
+    evaluasi_mk: Optional[pd.DataFrame] = None,
 ) -> None:
     st.subheader("Download Laporan")
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -2812,7 +2888,17 @@ def render_download_buttons_single(
         (col1, "Rekap CPMK", "Rekap_CPMK.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPMK": rekap_cpmk}),
         (col2, "Rekap IK", "Rekap_IK.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_IK": rekap_ik}),
         (col3, "Rekap CPL", "Rekap_CPL.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPL": rekap_cpl}),
-        (col4, "Laporan CQI", "Laporan_CQI.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Laporan_CQI": cqi}),
+        (
+            col4,
+            "Laporan CQI",
+            "Laporan_CQI.xlsx",
+            {
+                "Filter_Aktif": filter_info_dataframe(filters or {}),
+                "Laporan_CQI": cqi,
+                "Evaluasi_CQI_CPL": evaluasi_cqi if evaluasi_cqi is not None else pd.DataFrame(),
+                "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
+            },
+        ),
         (
             col5,
             "Semua Rekap",
@@ -2824,6 +2910,8 @@ def render_download_buttons_single(
                 "Rekap_IK": rekap_ik,
                 "Rekap_CPL": rekap_cpl,
                 "Laporan_CQI": cqi,
+                "Evaluasi_CQI_CPL": evaluasi_cqi if evaluasi_cqi is not None else pd.DataFrame(),
+                "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
                 "Rekap_CPMK_Filtered": rekap_cpmk,
                 "Rekap_IK_Filtered": rekap_ik,
                 "Rekap_CPL_Filtered": rekap_cpl,
@@ -2851,13 +2939,22 @@ def render_download_buttons_multi(
     cqi_all: pd.DataFrame,
     evaluasi_cqi: pd.DataFrame,
     filters: Optional[Dict[str, List[str]]] = None,
+    evaluasi_mk: Optional[pd.DataFrame] = None,
 ) -> None:
     st.subheader("Download Multi Semester")
     col1, col2, col3, col4 = st.columns(4)
     downloads = [
         (col1, "Tren CPL", "Tren_CPL.xlsx", {"Tren_CPL": trend_cpl}),
         (col2, "Tren IK", "Tren_IK.xlsx", {"Tren_IK": trend_ik}),
-        (col3, "Evaluasi CQI", "Evaluasi_CQI.xlsx", {"Evaluasi_CQI": evaluasi_cqi}),
+        (
+            col3,
+            "Evaluasi CQI",
+            "Evaluasi_CQI.xlsx",
+            {
+                "Evaluasi_CQI_CPL": evaluasi_cqi,
+                "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
+            },
+        ),
         (
             col4,
             "Semua Rekap Multi",
@@ -2873,7 +2970,8 @@ def render_download_buttons_multi(
                 "Tren_CPL": trend_cpl,
                 "Tren_IK": trend_ik,
                 "CQI_All": cqi_all,
-                "Evaluasi_CQI": evaluasi_cqi,
+                "Evaluasi_CQI_CPL": evaluasi_cqi,
+                "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
                 "Rekap_CPMK_Filtered": rekap_cpmk_all,
                 "Rekap_IK_Filtered": rekap_ik_all,
                 "Rekap_CPL_Filtered": rekap_cpl_all,
@@ -3251,17 +3349,24 @@ def render_single_mode() -> None:
     rekap_cpl = result["rekap_cpl"]
     cqi = result["cqi"]
 
-    render_download_buttons_single(rekap_cpmk, rekap_ik, rekap_cpl, cqi, export_filters)
-
     rekap_cpl_period = add_period_columns(rekap_cpl, "Single Semester", "-", "-")
     rekap_ik_period = add_period_columns(rekap_ik, "Single Semester", "-", "-")
     cqi_period = add_period_columns(cqi, "Single Semester", "-", "-")
     trend_cpl = make_trend_cpl(rekap_cpl_period)
     trend_ik = make_trend_ik(rekap_ik_period)
     evaluasi_cqi = make_cqi_evaluation(cqi_period, rekap_cpl_period, ["Single Semester"])
-    evaluasi_cqi = append_mk_equivalency_to_evaluation(
-        evaluasi_cqi,
-        [raw_data["_MK_Equivalency_Validation"]] if "_MK_Equivalency_Validation" in raw_data else [],
+    evaluasi_mk = make_mk_equivalency_evaluation(
+        [raw_data["_MK_Equivalency_Validation"]] if "_MK_Equivalency_Validation" in raw_data else []
+    )
+
+    render_download_buttons_single(
+        rekap_cpmk,
+        rekap_ik,
+        rekap_cpl,
+        cqi,
+        export_filters,
+        evaluasi_cqi=evaluasi_cqi,
+        evaluasi_mk=evaluasi_mk,
     )
 
     tab_names = [
@@ -3501,7 +3606,7 @@ def render_multi_mode() -> None:
     trend_ik = make_trend_ik(rekap_ik_all)
     cqi_all = add_cqi_tracking(cqi_all_raw, rekap_cpl_all, period_order)
     evaluasi_cqi = make_cqi_evaluation(cqi_all_raw, rekap_cpl_all, period_order)
-    evaluasi_cqi = append_mk_equivalency_to_evaluation(evaluasi_cqi, mk_equivalency_validation_frames)
+    evaluasi_mk = make_mk_equivalency_evaluation(mk_equivalency_validation_frames)
 
     render_download_buttons_multi(
         rekap_cpmk_all,
@@ -3512,6 +3617,7 @@ def render_multi_mode() -> None:
         cqi_all,
         evaluasi_cqi,
         export_filters,
+        evaluasi_mk=evaluasi_mk,
     )
 
     tab_names = [
@@ -4359,6 +4465,14 @@ def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=No
     ].min(axis=1)
     rekap["Kriteria"] = rekap["Rata-rata Nilai CPL"].apply(classify_achievement)
     rekap["Status"] = rekap["Rata-rata Nilai CPL"].apply(classify_status_by_score)
+    no_data_mask = rekap["Jumlah Mahasiswa"] <= 0
+    rekap["Catatan Validasi Data"] = "Data tersedia"
+    rekap.loc[no_data_mask, "Kriteria"] = "Belum terukur"
+    rekap.loc[no_data_mask, "Status"] = "Belum tersedia"
+    rekap.loc[
+        no_data_mask,
+        "Catatan Validasi Data",
+    ] = "Belum terdapat data CPMK pada periode/filter terpilih"
     ordered_columns = [
         "Kode CPL",
         "Rumusan CPL",
@@ -4368,6 +4482,7 @@ def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=No
         "Persentase Ketercapaian (%)",
         "Kriteria",
         "Status",
+        "Catatan Validasi Data",
     ]
     return CPLRekapDataFrame(rekap[ordered_columns].sort_values("Kode CPL").reset_index(drop=True))
 
@@ -4433,13 +4548,27 @@ def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame, rekap_cpmk: Op
     kriteria_col = pick_existing_column(cpl_work, ["Kriteria"])
     for _, cpl in cpl_work.drop_duplicates("Kode CPL").iterrows():
         kode_cpl = cpl.get("Kode CPL", "")
+        has_data = cpl_row_has_data(cpl)
         percent = get_numeric_from_row(cpl, percent_col, 0.0)
         actual = get_numeric_from_row(cpl, actual_col, 0.0)
+        jumlah_mahasiswa = int(row_numeric_value(cpl, ["Jumlah Mahasiswa"], 0))
+        jumlah_tercapai = int(row_numeric_value(cpl, ["Jumlah Mahasiswa Mencapai", "Jumlah Mahasiswa Tercapai"], 0))
         kriteria = cpl.get(kriteria_col, "") if kriteria_col else ""
         status = cpl.get(status_col, "") if status_col else ""
-        kriteria = classify_achievement(actual)
-        status = classify_status_by_score(actual)
-        rule = cqi_rule(actual)
+        if has_data:
+            kriteria = classify_achievement(actual)
+            status = classify_status_by_score(actual)
+            rule = cqi_rule(actual)
+            catatan_validasi = "Data tersedia"
+        else:
+            kriteria = "Belum terukur"
+            status = "Belum tersedia"
+            rule = {
+                "Prioritas": "Belum dapat dievaluasi",
+                "Temuan": "Data CPL belum tersedia pada periode/filter terpilih",
+                "Rekomendasi": "Lengkapi atau pilih data nilai CPMK yang relevan sebelum evaluasi CQI.",
+            }
+            catatan_validasi = "Belum terdapat data CPMK pada periode/filter terpilih"
         weak_ik = weakest_items(
             rekap_ik,
             kode_cpl,
@@ -4461,6 +4590,10 @@ def generate_cqi(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame, rekap_cpmk: Op
                 "Persentase Ketercapaian (%)": round(percent, 2),
                 "Kriteria": kriteria,
                 "Status": status,
+                "Catatan Validasi Data": catatan_validasi,
+                "Jumlah Mahasiswa": jumlah_mahasiswa,
+                "Jumlah Mahasiswa Tercapai": min(jumlah_tercapai, jumlah_mahasiswa),
+                "Keterangan Periode": "Data CQI berdasarkan periode/filter aktif",
                 "Temuan": rule["Temuan"],
                 "Analisis Penyebab": "Capaian dipengaruhi oleh IK/CPMK dengan ketercapaian terendah pada CPL terkait.",
                 "Prioritas": rule["Prioritas"],
@@ -4498,6 +4631,15 @@ def make_trend_cpl(rekap_cpl_all: pd.DataFrame) -> pd.DataFrame:
         frame["Rata-rata Nilai CPL"] = _final_numeric_series(frame, "Capaian CPL").clip(0, 100)
     frame["Kriteria"] = frame["Rata-rata Nilai CPL"].apply(classify_achievement)
     frame["Status"] = frame["Rata-rata Nilai CPL"].apply(classify_status_by_score)
+    if "Jumlah Mahasiswa" in frame.columns:
+        no_data_mask = pd.to_numeric(frame["Jumlah Mahasiswa"], errors="coerce").fillna(0) <= 0
+        frame.loc[no_data_mask, "Kriteria"] = "Belum terukur"
+        frame.loc[no_data_mask, "Status"] = "Belum tersedia"
+        frame["Catatan Validasi Data"] = "Data tersedia"
+        frame.loc[
+            no_data_mask,
+            "Catatan Validasi Data",
+        ] = "Belum terdapat data CPMK pada periode/filter terpilih"
     frame["Capaian Aktual"] = pd.to_numeric(frame["Rata-rata Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
     for column in ["Periode", "Tahun Akademik", "Semester", "Rumusan CPL", "Target"]:
         if column not in frame.columns:
@@ -4514,6 +4656,7 @@ def make_trend_cpl(rekap_cpl_all: pd.DataFrame) -> pd.DataFrame:
         "Persentase Ketercapaian (%)",
         "Kriteria",
         "Status",
+        "Catatan Validasi Data",
         "Capaian Aktual",
         "Target",
     ]

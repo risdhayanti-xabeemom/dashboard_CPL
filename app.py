@@ -1645,6 +1645,212 @@ def add_period_columns(df: pd.DataFrame, periode: str, tahun_akademik: str, seme
     return output
 
 
+EXPORT_METADATA_COLUMNS = [
+    "Tahun Akademik",
+    "Semester Akademik",
+    "Periode",
+    "Semester Kurikulum",
+    "Angkatan",
+]
+
+
+def metadata_value(series: Optional[pd.Series], default: str = "-") -> str:
+    if series is None:
+        return default
+    values = series.dropna().astype(str).str.strip()
+    values = values[~values.str.lower().isin(["", "nan", "none", "-"])]
+    if values.empty:
+        return default
+    unique_values = sorted(values.unique().tolist())
+    return unique_values[0] if len(unique_values) == 1 else ", ".join(unique_values)
+
+
+def add_missing_period_from_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    if "Periode" in output.columns and output["Periode"].astype(str).str.strip().ne("").any():
+        return output
+    tahun = get_series_safe(output, "Tahun Akademik")
+    semester = get_series_safe(output, "Semester Akademik")
+    if tahun is not None and semester is not None:
+        output["Periode"] = tahun.astype(str).str.strip() + " " + semester.astype(str).str.strip()
+    else:
+        output["Periode"] = "-"
+    return output
+
+
+def normalize_export_metadata_source(nilai: pd.DataFrame) -> pd.DataFrame:
+    if nilai is None or nilai.empty:
+        return pd.DataFrame(columns=EXPORT_METADATA_COLUMNS)
+    source = nilai.copy()
+    aliases = {
+        "Tahun Akademik": ["Tahun Akademik", "Tahun Ajaran", "TA"],
+        "Semester Akademik": ["Semester Akademik", "Semester Aktif", "Ganjil Genap"],
+        "Semester Kurikulum": ["Semester Kurikulum", "Semester"],
+        "Angkatan": ["Angkatan"],
+        "Periode": ["Periode"],
+    }
+    metadata = pd.DataFrame(index=source.index)
+    for canonical, alias_list in aliases.items():
+        column = find_column_by_alias(source, alias_list)
+        series = get_series_safe(source, column)
+        metadata[canonical] = series.astype(str).str.strip() if series is not None else ""
+    metadata = add_missing_period_from_metadata(metadata)
+    for column in EXPORT_METADATA_COLUMNS:
+        if column not in metadata.columns:
+            metadata[column] = "-"
+        metadata[column] = metadata[column].replace({"": "-", "nan": "-", "None": "-", "<NA>": "-"}).fillna("-")
+    return metadata[EXPORT_METADATA_COLUMNS]
+
+
+def metadata_groups_from_nilai(nilai: pd.DataFrame) -> pd.DataFrame:
+    metadata = normalize_export_metadata_source(nilai)
+    if metadata.empty:
+        return pd.DataFrame(columns=EXPORT_METADATA_COLUMNS)
+    return metadata.drop_duplicates().reset_index(drop=True)
+
+
+def attach_group_metadata(df: pd.DataFrame, group: pd.Series) -> pd.DataFrame:
+    output = df.copy()
+    for column in reversed(EXPORT_METADATA_COLUMNS):
+        if column in output.columns:
+            output = output.drop(columns=[column])
+        output.insert(0, column, group.get(column, "-"))
+    return output
+
+
+def order_export_columns(df: pd.DataFrame, preferred: List[str]) -> pd.DataFrame:
+    output = df.copy()
+    for column in preferred:
+        if column not in output.columns:
+            output[column] = ""
+    remaining = [column for column in output.columns if column not in preferred]
+    return output[preferred + remaining]
+
+
+def build_rekap_cpl_export(source_data: Optional[Dict[str, pd.DataFrame]], fallback_rekap_cpl: pd.DataFrame) -> pd.DataFrame:
+    base_columns = [
+        "Kode CPL",
+        "Rumusan CPL",
+        "Rata-rata Nilai CPL",
+        "Jumlah Mahasiswa",
+        "Jumlah Mahasiswa Mencapai",
+        "Persentase Ketercapaian (%)",
+        "Kriteria",
+        "Status",
+    ]
+    preferred = EXPORT_METADATA_COLUMNS + base_columns
+    if not source_data or "Nilai_CPMK" not in source_data or source_data["Nilai_CPMK"].empty:
+        fallback = fallback_rekap_cpl.copy() if fallback_rekap_cpl is not None else pd.DataFrame(columns=base_columns)
+        groups = metadata_groups_from_nilai(source_data.get("Nilai_CPMK", pd.DataFrame()) if source_data else pd.DataFrame())
+        if groups.empty:
+            for column in reversed(EXPORT_METADATA_COLUMNS):
+                fallback.insert(0, column, "-")
+            return order_export_columns(fallback, preferred)
+        return order_export_columns(attach_group_metadata(fallback, groups.iloc[0]), preferred)
+
+    nilai = source_data["Nilai_CPMK"].copy()
+    metadata = normalize_export_metadata_source(nilai)
+    nilai_with_meta = nilai.copy()
+    for column in EXPORT_METADATA_COLUMNS:
+        nilai_with_meta[column] = metadata[column].values
+
+    rows = []
+    for keys, group_nilai in nilai_with_meta.groupby(EXPORT_METADATA_COLUMNS, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        group_meta = pd.Series(dict(zip(EXPORT_METADATA_COLUMNS, keys)))
+        group_data = {sheet: frame.copy() for sheet, frame in source_data.items() if isinstance(frame, pd.DataFrame)}
+        group_data["Nilai_CPMK"] = group_nilai.drop(columns=EXPORT_METADATA_COLUMNS, errors="ignore")
+        try:
+            group_result = calculate_all(group_data)
+            group_rekap = group_result["rekap_cpl"].copy()
+        except Exception:
+            group_rekap = fallback_rekap_cpl.copy()
+        rows.append(attach_group_metadata(group_rekap, group_meta))
+
+    if not rows:
+        return order_export_columns(fallback_rekap_cpl.copy(), preferred)
+    export = pd.concat(rows, ignore_index=True)
+    return order_export_columns(export, preferred)
+
+
+def metadata_by_period(nilai: pd.DataFrame) -> pd.DataFrame:
+    metadata = normalize_export_metadata_source(nilai)
+    if metadata.empty:
+        return pd.DataFrame(columns=["Periode"] + EXPORT_METADATA_COLUMNS)
+    grouped_rows = []
+    for periode, group in metadata.groupby("Periode", dropna=False):
+        row = {"Periode": periode}
+        for column in EXPORT_METADATA_COLUMNS:
+            row[column] = metadata_value(group[column])
+        grouped_rows.append(row)
+    return pd.DataFrame(grouped_rows)
+
+
+def metadata_summary_row(nilai: pd.DataFrame) -> Dict[str, str]:
+    metadata = normalize_export_metadata_source(nilai)
+    if metadata.empty:
+        return {column: "-" for column in EXPORT_METADATA_COLUMNS}
+    return {column: metadata_value(metadata[column]) for column in EXPORT_METADATA_COLUMNS}
+
+
+def prepare_cqi_export_with_metadata(cqi_df: pd.DataFrame, source_nilai: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if cqi_df is None:
+        cqi_df = pd.DataFrame()
+    output = cqi_df.copy()
+    if output.empty:
+        for column in reversed(EXPORT_METADATA_COLUMNS):
+            output.insert(0, column, "")
+        return output
+    period_metadata = metadata_by_period(source_nilai if source_nilai is not None else pd.DataFrame())
+    merge_col = "Periode"
+    if "Periode Awal" in output.columns:
+        output["_Periode_Metadata_Key"] = output["Periode Awal"]
+        merge_col = "_Periode_Metadata_Key"
+    elif "Periode" in output.columns:
+        output["_Periode_Metadata_Key"] = output["Periode"]
+        merge_col = "_Periode_Metadata_Key"
+    if not period_metadata.empty and merge_col in output.columns:
+        output = output.merge(
+            period_metadata.rename(columns={"Periode": merge_col}),
+            on=merge_col,
+            how="left",
+            suffixes=("", "_Meta"),
+        )
+    else:
+        summary = metadata_summary_row(source_nilai if source_nilai is not None else pd.DataFrame())
+        for column in EXPORT_METADATA_COLUMNS:
+            if column not in output.columns:
+                output[column] = summary[column]
+    for column in EXPORT_METADATA_COLUMNS:
+        meta_col = f"{column}_Meta"
+        if meta_col in output.columns:
+            if column in output.columns:
+                current = output[column].fillna("").astype(str).str.strip()
+                invalid = current.isin(["", "-", "nan", "None", "<NA>"])
+                output[column] = output[column].where(~invalid, output[meta_col])
+            else:
+                output[column] = output[meta_col]
+            output = output.drop(columns=[meta_col])
+        if column not in output.columns:
+            output[column] = ""
+        output[column] = output[column].fillna("").astype(str).replace({"": "-"})
+    output = output.drop(columns=["_Periode_Metadata_Key"], errors="ignore")
+    preferred = EXPORT_METADATA_COLUMNS + [
+        "Kode CPL",
+        "Rumusan CPL",
+        "Capaian Aktual",
+        "Rata-rata Nilai CPL",
+        "Kriteria",
+        "Status",
+        "Temuan",
+        "Analisis Penyebab",
+        "Rekomendasi",
+        "Tindak Lanjut",
+    ]
+    return order_export_columns(output, preferred)
+
+
 def get_student_key_columns(df: pd.DataFrame) -> Optional[List[str]]:
     if df is None or df.empty:
         return None
@@ -3090,23 +3296,33 @@ def render_download_buttons_single(
     evaluasi_cqi: Optional[pd.DataFrame] = None,
     evaluasi_mk: Optional[pd.DataFrame] = None,
     fast_mode: bool = False,
+    export_source_data: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> None:
     st.subheader("Download Laporan")
     if fast_mode:
         st.caption("Mode cepat aktif: file Excel export baru dibuat setelah tombol Siapkan ditekan.")
     col1, col2, col3, col4, col5 = st.columns(5)
+    cqi_export = lambda: prepare_cqi_export_with_metadata(
+        cqi,
+        export_source_data.get("Nilai_CPMK") if export_source_data else pd.DataFrame(),
+    )
+    evaluasi_cqi_export = lambda: prepare_cqi_export_with_metadata(
+        evaluasi_cqi if evaluasi_cqi is not None else pd.DataFrame(),
+        export_source_data.get("Nilai_CPMK") if export_source_data else pd.DataFrame(),
+    )
+    rekap_cpl_export = lambda: build_rekap_cpl_export(export_source_data, rekap_cpl)
     downloads = [
         (col1, "Rekap CPMK", "Rekap_CPMK.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPMK": rekap_cpmk}),
         (col2, "Rekap IK", "Rekap_IK.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_IK": rekap_ik}),
-        (col3, "Rekap CPL", "Rekap_CPL.xlsx", {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPL": rekap_cpl}),
+        (col3, "Rekap CPL", "Rekap_CPL.xlsx", lambda: {"Filter_Aktif": filter_info_dataframe(filters or {}), "Rekap_CPL": rekap_cpl_export()}),
         (
             col4,
             "Laporan CQI",
             "Laporan_CQI.xlsx",
-            {
+            lambda: {
                 "Filter_Aktif": filter_info_dataframe(filters or {}),
-                "Laporan_CQI": cqi,
-                "Evaluasi_CQI_CPL": evaluasi_cqi if evaluasi_cqi is not None else pd.DataFrame(),
+                "Laporan_CQI": cqi_export(),
+                "Evaluasi_CQI_CPL": evaluasi_cqi_export(),
                 "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
             },
         ),
@@ -3119,13 +3335,13 @@ def render_download_buttons_single(
                 "Rekap_CPMK": rekap_cpmk,
                 "Tren_CPMK": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk)),
                 "Rekap_IK": rekap_ik,
-                "Rekap_CPL": rekap_cpl,
-                "Laporan_CQI": cqi,
-                "Evaluasi_CQI_CPL": evaluasi_cqi if evaluasi_cqi is not None else pd.DataFrame(),
+                "Rekap_CPL": rekap_cpl_export(),
+                "Laporan_CQI": cqi_export(),
+                "Evaluasi_CQI_CPL": evaluasi_cqi_export(),
                 "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
                 "Rekap_CPMK_Filtered": rekap_cpmk,
                 "Rekap_IK_Filtered": rekap_ik,
-                "Rekap_CPL_Filtered": rekap_cpl,
+                "Rekap_CPL_Filtered": rekap_cpl_export(),
                 "Tren_CPMK_Filtered": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk)),
             },
         ),
@@ -3146,11 +3362,16 @@ def render_download_buttons_multi(
     filters: Optional[Dict[str, List[str]]] = None,
     evaluasi_mk: Optional[pd.DataFrame] = None,
     fast_mode: bool = False,
+    export_source_data: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> None:
     st.subheader("Download Multi Semester")
     if fast_mode:
         st.caption("Mode cepat aktif: file Excel export baru dibuat setelah tombol Siapkan ditekan.")
     col1, col2, col3, col4 = st.columns(4)
+    source_nilai = export_source_data.get("Nilai_CPMK") if export_source_data else pd.DataFrame()
+    evaluasi_cqi_export = lambda: prepare_cqi_export_with_metadata(evaluasi_cqi, source_nilai)
+    cqi_all_export = lambda: prepare_cqi_export_with_metadata(cqi_all, source_nilai)
+    rekap_cpl_export = lambda: build_rekap_cpl_export(export_source_data, rekap_cpl_all)
     downloads = [
         (col1, "Tren CPL", "Tren_CPL.xlsx", {"Tren_CPL": trend_cpl}),
         (col2, "Tren IK", "Tren_IK.xlsx", {"Tren_IK": trend_ik}),
@@ -3158,8 +3379,8 @@ def render_download_buttons_multi(
             col3,
             "Evaluasi CQI",
             "Evaluasi_CQI.xlsx",
-            {
-                "Evaluasi_CQI_CPL": evaluasi_cqi,
+            lambda: {
+                "Evaluasi_CQI_CPL": evaluasi_cqi_export(),
                 "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
             },
         ),
@@ -3174,15 +3395,15 @@ def render_download_buttons_multi(
                 "Tren_CPMK": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk_all)),
                 "Tren_CPMK_Per_Periode": prepare_trend_cpmk(rekap_cpmk_all),
                 "Rekap_IK_All": rekap_ik_all,
-                "Rekap_CPL_All": rekap_cpl_all,
+                "Rekap_CPL_All": rekap_cpl_export(),
                 "Tren_CPL": trend_cpl,
                 "Tren_IK": trend_ik,
-                "CQI_All": cqi_all,
-                "Evaluasi_CQI_CPL": evaluasi_cqi,
+                "CQI_All": cqi_all_export(),
+                "Evaluasi_CQI_CPL": evaluasi_cqi_export(),
                 "Evaluasi_Perubahan_MK": evaluasi_mk if evaluasi_mk is not None else pd.DataFrame(),
                 "Rekap_CPMK_Filtered": rekap_cpmk_all,
                 "Rekap_IK_Filtered": rekap_ik_all,
-                "Rekap_CPL_Filtered": rekap_cpl_all,
+                "Rekap_CPL_Filtered": rekap_cpl_export(),
                 "Tren_CPMK_Filtered": prepare_trend_cpmk(aggregate_rekap_cpmk_multi(rekap_cpmk_all)),
             },
         ),
@@ -3583,6 +3804,7 @@ def render_single_mode() -> None:
         evaluasi_cqi=evaluasi_cqi,
         evaluasi_mk=evaluasi_mk,
         fast_mode=fast_mode,
+        export_source_data=filtered_data,
     )
 
     tab_names = [
@@ -3812,6 +4034,12 @@ def render_multi_mode() -> None:
     rekap_ik_all = filter_frame(rekap_ik_all, multi_filters)
     rekap_cpl_all = filter_frame(rekap_cpl_all, multi_filters)
     cqi_all_raw = filter_frame(cqi_all_raw, multi_filters)
+    export_source_data = {sheet: frame.copy() for sheet, frame in base_data.items()}
+    export_source_data["Nilai_CPMK"] = filter_frame(combined_nilai_cpmk, multi_filters)
+    if "Mapping_CPMK" in export_source_data:
+        export_source_data["Mapping_CPMK"] = filter_frame(
+            export_source_data["Mapping_CPMK"], multi_filters, "Komponen Asesmen"
+        )
     if not detail_asesmen_all.empty:
         detail_asesmen_all = filter_frame(detail_asesmen_all, multi_filters, "Komponen")
     export_filters = {**multi_filters, **global_filters}
@@ -3845,6 +4073,7 @@ def render_multi_mode() -> None:
         export_filters,
         evaluasi_mk=evaluasi_mk,
         fast_mode=st.session_state.get("multi_fast_mode", True),
+        export_source_data=export_source_data,
     )
 
     tab_names = [

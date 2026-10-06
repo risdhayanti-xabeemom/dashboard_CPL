@@ -11,6 +11,7 @@ Format input Excel lama tetap dipakai. Fitur multi-semester tidak menambah atau 
 - `template_input.xlsx`: template Excel kosong dengan header lengkap, dibuat otomatis saat aplikasi dijalankan bila belum ada.
 - `sample_data.xlsx`: data contoh kecil untuk uji coba, dibuat otomatis saat aplikasi dijalankan bila belum ada.
 - `README.md`: panduan penggunaan.
+- `neobrutal.py`, `neobrutal_plotly.py`, `assets/neobrutal.css`, `.streamlit/config.toml`: tema tampilan neo-brutalism (warna diatur di blok `:root` pada `assets/neobrutal.css`).
 
 Logo sidebar dapat memakai file berikut bila tersedia:
 

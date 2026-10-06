@@ -12,7 +12,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from neobrutal import apply_theme, page_header
+from neobrutal import apply_theme, badge
+from neobrutal_plotly import apply_plotly_theme
 
 
 CPL_STUDENT_ACHIEVEMENT_THRESHOLD = 73.0
@@ -228,19 +229,19 @@ RECOMMENDATIONS = {
 }
 
 STATUS_COLORS = {
-    "Melampaui": "#2563eb",
-    "Memenuhi Target": "#1f9d55",
-    "Tercapai": "#1f9d55",
-    "Perlu Perhatian": "#d89b00",
-    "Belum Tercapai": "#d64545",
+    "Melampaui": "#3a4fd7",
+    "Memenuhi Target": "#3fbf84",
+    "Tercapai": "#3fbf84",
+    "Perlu Perhatian": "#f6c453",
+    "Belum Tercapai": "#e5533d",
 }
 
 ACHIEVEMENT_COLORS = {
-    "Sangat Kurang": "#991b1b",
-    "Kurang": "#f97316",
-    "Cukup": "#facc15",
-    "Baik": "#2563eb",
-    "Sangat Baik": "#16a34a",
+    "Sangat Kurang": "#b3322a",
+    "Kurang": "#f08a3c",
+    "Cukup": "#f6c453",
+    "Baik": "#3a4fd7",
+    "Sangat Baik": "#3fbf84",
 }
 
 MASTER_WORKBOOK_CANDIDATES = [
@@ -333,19 +334,38 @@ COMPONENT_ALIASES = {
 
 
 def load_custom_css() -> None:
-    """Tema tampilan ada di assets/neobrutal.css (lihat neobrutal.py)."""
+    """Tema tampilan: assets/neobrutal.css (lihat neobrutal.py) dan template grafik Plotly."""
+    if not (Path(__file__).parent / "assets" / "neobrutal.css").exists():
+        st.warning(
+            "Berkas tema assets/neobrutal.css tidak ditemukan, "
+            "jadi tampilan memakai tema bawaan Streamlit."
+        )
     apply_theme()
+    apply_plotly_theme()
 
 
 def render_main_header() -> None:
-    page_header(
-        "Dashboard Asesmen CPL dan CQI",
-        [
-            "Program Studi D3 Teknik Elektronika",
-            "Jurusan Teknik Elektro",
-            "Politeknik Negeri Malang",
-        ],
-        chips=[("OBE / IABEE", "yellow"), ("Single & Multi Semester", "lilac")],
+    steps = [
+        ("1", "Nilai CPMK dari dosen", "Input", "yellow"),
+        ("2", "Capaian CPMK dan IK", "Hitung", "lilac"),
+        ("3", "Status ketercapaian CPL", "Hitung", "lilac"),
+        ("4", "Laporan CQI dan tren", "Hasil", "mint"),
+    ]
+    items = "".join(
+        f'<li><span class="nb-step">{number}</span>{escape(label)}{badge(tag, tone)}</li>'
+        for number, label, tag, tone in steps
+    )
+    # Satu baris tanpa baris kosong, supaya parser Markdown tidak memotong blok HTML.
+    st.markdown(
+        '<div class="nb-hero"><div class="nb-hero-grid"><div>'
+        "<h1>Dashboard Asesmen CPL dan CQI</h1>"
+        '<div class="subtitle">Program Studi D3 Teknik Elektronika<br>'
+        "Jurusan Teknik Elektro<br>Politeknik Negeri Malang</div>"
+        f'<div class="nb-chips">{badge("OBE / IABEE", "yellow")}'
+        f'{badge("Single & Multi Semester", "lilac")}</div></div>'
+        f'<div class="nb-flow"><div class="nb-flow-title">Alur asesmen</div><ol>{items}</ol></div>'
+        "</div></div>",
+        unsafe_allow_html=True,
     )
 
 
@@ -2470,7 +2490,7 @@ def render_student_cpl_radar(
             theta=theta + [theta[0]],
             fill="toself",
             name="Nilai CPL Mahasiswa",
-            line_color="#2563eb",
+            line_color="#3a4fd7",
         )
     )
     radar.add_trace(
@@ -2479,7 +2499,7 @@ def render_student_cpl_radar(
             theta=theta + [theta[0]],
             mode="lines",
             name="Target Minimum 50",
-            line=dict(color="#ef4444", dash="dash"),
+            line=dict(color="#e5533d", dash="dash"),
         )
     )
     radar.update_layout(
@@ -2487,7 +2507,7 @@ def render_student_cpl_radar(
         polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
         showlegend=True,
     )
-    st.plotly_chart(radar, use_container_width=True)
+    st.plotly_chart(radar, use_container_width=True, theme=None)
 
     display_detail = detail.drop(columns=["Has Data"]).copy()
     display_detail["Nilai CPL"] = display_detail["Nilai CPL"].round(2)
@@ -3334,7 +3354,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
             STATUS_COLORS["Perlu Perhatian"],
         )
     with col4:
-        render_kpi_card("Rata-rata Capaian CPL", f"{average_cpl:.2f}%", "Rerata seluruh CPL", "#0f4c81")
+        render_kpi_card("Rata-rata Capaian CPL", f"{average_cpl:.2f}%", "Rerata seluruh CPL", "#3a4fd7")
 
     render_dashboard_narrative(average_cpl, melampaui, memenuhi_target, perlu_perhatian)
 
@@ -3350,7 +3370,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
     )
     bar.update_traces(texttemplate="%{text}%", textposition="outside")
     bar.update_layout(yaxis_title="Capaian (%)", xaxis_title="CPL", legend_title_text="Status")
-    st.plotly_chart(bar, use_container_width=True)
+    st.plotly_chart(bar, use_container_width=True, theme=None)
 
     radar_df = cpl_display.sort_values("Kode CPL", key=lambda col: col.map(sort_cpl_key))
     theta = radar_df["Kode CPL"].tolist()
@@ -3363,7 +3383,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
                 theta=theta + [theta[0]],
                 fill="toself",
                 name="Capaian CPL",
-                line_color="#2563eb",
+                line_color="#3a4fd7",
             )
         )
         radar.update_layout(
@@ -3371,7 +3391,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
             polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
             showlegend=False,
         )
-        st.plotly_chart(radar, use_container_width=True)
+        st.plotly_chart(radar, use_container_width=True, theme=None)
 
     heatmap_source = rekap_ik.pivot_table(
         index="Kode IK", columns="Kode CPL", values="Capaian IK", aggfunc="mean"
@@ -3381,12 +3401,12 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
         labels=dict(x="CPL", y="IK", color="Capaian (%)"),
         text_auto=".1f",
         aspect="auto",
-        color_continuous_scale="RdYlGn",
+        color_continuous_scale=[[0, "#f4806b"], [0.5, "#f6c453"], [1, "#a6e8c4"]],
         zmin=0,
         zmax=100,
         title="Heatmap Capaian IK per CPL",
     )
-    st.plotly_chart(heatmap, use_container_width=True)
+    st.plotly_chart(heatmap, use_container_width=True, theme=None)
 
 
 def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
@@ -3419,7 +3439,7 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
         hover_data=[column for column in ["Mata Kuliah", "Rumusan CPMK", "Kode CPL", "Kode IK"] if column in filtered.columns],
     )
     chart.update_layout(yaxis_title="Persentase Ketercapaian CPMK (%)", xaxis_title="CPMK")
-    st.plotly_chart(chart, use_container_width=True)
+    st.plotly_chart(chart, use_container_width=True, theme=None)
     summary = (
         filtered["Kriteria"]
         .value_counts()
@@ -3463,7 +3483,7 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
         title=f"Distribusi Ketercapaian IK dalam {selected_cpl}",
     )
     chart.update_layout(yaxis_title="Persentase Ketercapaian IK (%)", xaxis_title="Kode IK")
-    st.plotly_chart(chart, use_container_width=True)
+    st.plotly_chart(chart, use_container_width=True, theme=None)
     table_columns = [column for column in ["Kode IK", "Rumusan IK", "Capaian IK", "Persentase Ketercapaian", "Kriteria", "Status"] if column in filtered.columns]
     st.dataframe(
         format_display(filtered[table_columns]),
@@ -3518,7 +3538,7 @@ def render_detail_asesmen(detail: pd.DataFrame) -> None:
         title="Rata-rata Nilai Komponen Asesmen",
         hover_data=["Mata Kuliah", "Kode CPMK", "Bobot Komponen"],
     )
-    st.plotly_chart(chart, use_container_width=True)
+    st.plotly_chart(chart, use_container_width=True, theme=None)
     st.dataframe(format_display(summary), use_container_width=True, hide_index=True)
 
     table_columns = [
@@ -5293,14 +5313,14 @@ def render_trend_cpmk(rekap_cpmk: pd.DataFrame) -> None:
     fig.add_hline(
         y=CPL_STUDENT_ACHIEVEMENT_THRESHOLD,
         line_dash="dash",
-        line_color="#ef4444",
+        line_color="#e5533d",
         annotation_text="Target Minimum 73",
         annotation_position="top left",
     )
     fig.update_traces(textposition="outside", cliponaxis=False)
     fig.update_layout(height=560, xaxis_tickangle=-45)
     fig.update_yaxes(range=[0, 105], title="Capaian CPMK")
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", theme=None)
 
     table_columns = [
         "Kode CPMK",
@@ -5347,9 +5367,9 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
     )
 
     status_colors = {
-        "Perlu Perhatian": "#f97316",
-        "Memenuhi Target": "#2563eb",
-        "Melampaui": "#16a34a",
+        "Perlu Perhatian": "#f08a3c",
+        "Memenuhi Target": "#3a4fd7",
+        "Melampaui": "#3fbf84",
     }
     chart = px.bar(
         cpl,
@@ -5363,7 +5383,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
     )
     chart.update_traces(textposition="outside", cliponaxis=False)
     chart.update_yaxes(range=[0, 105])
-    st.plotly_chart(chart, width="stretch")
+    st.plotly_chart(chart, width="stretch", theme=None)
 
     labels = cpl["Kode CPL"].tolist()
     values = cpl["Rata-rata Nilai CPL"].round(2).tolist()
@@ -5377,7 +5397,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
                 theta=closed_labels,
                 fill="toself",
                 name="Rata-rata Capaian CPL",
-                line=dict(color="#2563eb"),
+                line=dict(color="#3a4fd7"),
                 opacity=0.65,
             )
         )
@@ -5387,7 +5407,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
                 theta=closed_labels,
                 mode="lines",
                 name="Target Minimum 73",
-                line=dict(color="#ef4444", dash="dash"),
+                line=dict(color="#e5533d", dash="dash"),
             )
         )
         radar.update_layout(
@@ -5395,7 +5415,7 @@ def render_dashboard(rekap_cpl: pd.DataFrame, rekap_ik: pd.DataFrame) -> None:
             polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
             showlegend=True,
         )
-        st.plotly_chart(radar, width="stretch")
+        st.plotly_chart(radar, width="stretch", theme=None)
 
 
 def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
@@ -5499,7 +5519,7 @@ def render_trend_cpl(trend_cpl: pd.DataFrame) -> None:
     fig.update_traces(texttemplate="%{text:.1f}%", textposition="inside")
     fig.update_layout(barmode="stack")
     fig.update_yaxes(range=[0, 100], title="Komposisi CPMK (%)")
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", theme=None)
 
     pivot = grouped.pivot_table(
         index="Kode CPL",
@@ -5623,7 +5643,7 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
     fig.update_traces(texttemplate="%{text:.1f}%", textposition="inside")
     fig.update_layout(barmode="stack")
     fig.update_yaxes(range=[0, 100], title="Komposisi CPMK (%)")
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", theme=None)
 
     pivot = grouped.pivot_table(
         index="Kode IK",
@@ -5729,7 +5749,7 @@ def render_student_cpl_radar(
             theta=closed_theta,
             fill="toself",
             name="Nilai CPL Mahasiswa",
-            line=dict(color="#2563eb"),
+            line=dict(color="#3a4fd7"),
             opacity=0.65,
         )
     )
@@ -5739,7 +5759,7 @@ def render_student_cpl_radar(
             theta=closed_theta,
             mode="lines",
             name="Target Minimum 73",
-            line=dict(color="#ef4444", dash="dash"),
+            line=dict(color="#e5533d", dash="dash"),
         )
     )
     radar.add_trace(
@@ -5748,7 +5768,7 @@ def render_student_cpl_radar(
             theta=closed_theta,
             mode="lines",
             name="Rata-rata CPL",
-            line=dict(color="#f97316"),
+            line=dict(color="#f08a3c"),
         )
     )
     radar.add_trace(
@@ -5757,7 +5777,7 @@ def render_student_cpl_radar(
             theta=closed_theta,
             mode="lines",
             name="CPL Tertinggi",
-            line=dict(color="#16a34a"),
+            line=dict(color="#3fbf84"),
         )
     )
     radar.add_trace(
@@ -5766,7 +5786,7 @@ def render_student_cpl_radar(
             theta=closed_theta,
             mode="lines",
             name="CPL Terendah",
-            line=dict(color="#6b7280"),
+            line=dict(color="#5c564b"),
         )
     )
     radar.update_layout(
@@ -5774,7 +5794,7 @@ def render_student_cpl_radar(
         polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
         showlegend=True,
     )
-    st.plotly_chart(radar, width="stretch")
+    st.plotly_chart(radar, width="stretch", theme=None)
 
     table = detail[["Kode CPL", "Rumusan CPL", "Nilai CPL Mahasiswa", "Kriteria", "Status"]].copy()
     st.dataframe(format_display(table), width="stretch", hide_index=True)

@@ -12,6 +12,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from neobrutal import apply_theme, page_header
+
 
 CPL_STUDENT_ACHIEVEMENT_THRESHOLD = 73.0
 CPL_PERCENT_TARGET = 70.0
@@ -331,139 +333,19 @@ COMPONENT_ALIASES = {
 
 
 def load_custom_css() -> None:
-    st.markdown(
-        """
-        <style>
-        :root {
-            --primary: #0f4c81;
-            --primary-dark: #12324f;
-            --surface: #ffffff;
-            --muted: #64748b;
-            --line: #e2e8f0;
-            --green: #1f9d55;
-            --orange: #d89b00;
-            --red: #d64545;
-        }
-        .block-container {
-            padding-top: 1.25rem;
-            padding-bottom: 2.5rem;
-        }
-        .app-header {
-            padding: 1.25rem 1.5rem;
-            border: 1px solid var(--line);
-            border-left: 6px solid var(--primary);
-            border-radius: 8px;
-            background: linear-gradient(135deg, #ffffff 0%, #eef6fb 100%);
-            margin-bottom: 1rem;
-        }
-        .app-header h1 {
-            margin: 0;
-            font-size: 2rem;
-            line-height: 1.2;
-            color: var(--primary-dark);
-            letter-spacing: 0;
-        }
-        .app-header .subtitle {
-            margin-top: .45rem;
-            color: #334155;
-            font-size: 1.02rem;
-            line-height: 1.55;
-        }
-        .section-caption {
-            margin: .75rem 0 .35rem;
-            color: var(--primary-dark);
-            font-weight: 700;
-            font-size: .92rem;
-        }
-        .sidebar-logo-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: .65rem;
-            margin-bottom: .75rem;
-        }
-        .logo-placeholder {
-            min-height: 76px;
-            border: 1px dashed #94a3b8;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            color: #475569;
-            background: #f8fafc;
-            font-size: .84rem;
-            font-weight: 600;
-        }
-        .kpi-card {
-            min-height: 118px;
-            padding: 1rem 1rem .95rem;
-            border: 1px solid var(--line);
-            border-radius: 8px;
-            background: var(--surface);
-            box-shadow: 0 10px 24px rgba(15, 23, 42, .07);
-            position: relative;
-            overflow: hidden;
-        }
-        .kpi-card::before {
-            content: "";
-            position: absolute;
-            left: 0;
-            top: 0;
-            bottom: 0;
-            width: 6px;
-            background: var(--accent);
-        }
-        .kpi-label {
-            color: var(--muted);
-            font-size: .88rem;
-            font-weight: 700;
-            margin-bottom: .4rem;
-        }
-        .kpi-value {
-            color: #0f172a;
-            font-size: 2rem;
-            line-height: 1;
-            font-weight: 800;
-        }
-        .kpi-note {
-            color: var(--muted);
-            font-size: .82rem;
-            margin-top: .45rem;
-        }
-        .narrative-box {
-            border: 1px solid #bfdbfe;
-            background: #eff6ff;
-            color: #1e3a5f;
-            border-radius: 8px;
-            padding: .95rem 1rem;
-            margin: 1rem 0;
-            line-height: 1.5;
-        }
-        div[data-testid="stSidebar"] h2, div[data-testid="stSidebar"] h3 {
-            color: var(--primary-dark);
-        }
-        div[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
-            margin-bottom: .35rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """Tema tampilan ada di assets/neobrutal.css (lihat neobrutal.py)."""
+    apply_theme()
 
 
 def render_main_header() -> None:
-    st.markdown(
-        """
-        <div class="app-header">
-            <h1>Dashboard Asesmen CPL dan CQI</h1>
-            <div class="subtitle">
-                Program Studi D3 Teknik Elektronika<br>
-                Jurusan Teknik Elektro<br>
-                Politeknik Negeri Malang
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    page_header(
+        "Dashboard Asesmen CPL dan CQI",
+        [
+            "Program Studi D3 Teknik Elektronika",
+            "Jurusan Teknik Elektro",
+            "Politeknik Negeri Malang",
+        ],
+        chips=[("OBE / IABEE", "yellow"), ("Single & Multi Semester", "lilac")],
     )
 
 

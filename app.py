@@ -679,13 +679,27 @@ def data_cache_signature(data: Dict[str, pd.DataFrame]) -> str:
     return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()
 
 
+# Naikkan angka ini setiap kali cara hitung berubah. Cache Streamlit hanya melihat kode fungsi
+# yang di-cache, bukan fungsi yang dipanggilnya, sehingga tanpa versi ini file yang sama tetap
+# memakai hasil hitung lama sampai app di-reboot.
+CALCULATION_VERSION = "2026-11-05.1"
+
+
 @st.cache_data(show_spinner="Menghitung capaian CPL, IK, dan CPMK...")
-def calculate_all_cached(_data: Dict[str, pd.DataFrame], batas_nilai: float, target_cpl: float, cache_key: str):
+def calculate_all_cached(
+    _data: Dict[str, pd.DataFrame],
+    batas_nilai: float,
+    target_cpl: float,
+    cache_key: str,
+    calculation_version: str = "",
+):
     return calculate_all(_data, batas_nilai, target_cpl)
 
 
 @st.cache_data(show_spinner="Menghitung capaian periode...")
-def calculate_period_result_cached(period_label: str, _data: Dict[str, pd.DataFrame], cache_key: str):
+def calculate_period_result_cached(
+    period_label: str, _data: Dict[str, pd.DataFrame], cache_key: str, calculation_version: str = ""
+):
     return calculate_period_result(period_label, _data)
 
 
@@ -3695,7 +3709,9 @@ def render_single_mode() -> None:
             str(float(target_cpl)),
         ]
     )
-    result = calculate_all_cached(filtered_data, float(batas_nilai), float(target_cpl), calculate_key)
+    result = calculate_all_cached(
+        filtered_data, float(batas_nilai), float(target_cpl), calculate_key, CALCULATION_VERSION
+    )
     rekap_cpmk = result["rekap_cpmk"]
     rekap_ik = result["rekap_ik"]
     rekap_cpl = result["rekap_cpl"]
@@ -3896,7 +3912,7 @@ def render_multi_mode() -> None:
                     data_cache_signature({"Nilai_CPMK": period_nilai}),
                 ]
             )
-            period_results.append(calculate_period_result_cached(periode, period_data, period_key))
+            period_results.append(calculate_period_result_cached(periode, period_data, period_key, CALCULATION_VERSION))
         except Exception as exc:  # pragma: no cover - shown to Streamlit users
             validation_errors.append(f"{periode}: {exc}")
 

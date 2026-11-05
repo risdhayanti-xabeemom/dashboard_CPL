@@ -1448,6 +1448,20 @@ def has_out_of_range_input_values(data: Dict[str, pd.DataFrame]) -> bool:
 
 def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     prepared = {sheet: df.copy() for sheet, df in data.items()}
+    # Sel gabungan (merge) di Excel hanya terbaca pada baris pertama; baris berikutnya kosong.
+    # Isi ke bawah agar setiap IK tetap punya Kode CPL dan tidak hilang dari Rekap IK.
+    merged_fill_columns = {
+        "Master_CPL": ["Kode CPL", "Rumusan CPL"],
+        "Master_IK": ["Kode CPL"],
+    }
+    for sheet, columns in merged_fill_columns.items():
+        if sheet not in prepared:
+            continue
+        for column in columns:
+            if column in prepared[sheet].columns:
+                series = prepared[sheet][column]
+                blank = series.isna() | series.astype(str).str.strip().isin(["", "nan", "None", "<NA>"])
+                prepared[sheet][column] = series.mask(blank).ffill()
     code_columns = {
         "Master_CPL": ["Kode CPL"],
         "Master_IK": ["Kode IK", "Kode CPL"],
@@ -4429,6 +4443,24 @@ def clean_code_column(df, col):
     return df
 
 
+VALID_IK_CODE_PATTERN = re.compile(r"IK\s*[-_]?\s*\d+(?:\s*\.\s*\d+)*", re.IGNORECASE)
+VALID_CPMK_CODE_PATTERN = re.compile(r"CPMK\s*[-_]?\s*\d+(?:\s*\.\s*\d+)*", re.IGNORECASE)
+
+
+def is_valid_ik_code(value) -> bool:
+    # Terima "IK1.1", "IK01.01", "IK 1.1", atau kode dengan awalan lain.
+    if value is None or pd.isna(value):
+        return False
+    return bool(VALID_IK_CODE_PATTERN.search(str(value)))
+
+
+def is_valid_cpmk_code(value) -> bool:
+    # Terima "CPMK1", "CPMK1.1", "CPMK 011", dan kode berawalan MK seperti "REC231001-CPMK1".
+    if value is None or pd.isna(value):
+        return False
+    return bool(VALID_CPMK_CODE_PATTERN.search(str(value)))
+
+
 def filter_valid_codes(df, require_cpl=False, require_ik=False, require_cpmk=False):
     df = df.copy()
 
@@ -4443,13 +4475,13 @@ def filter_valid_codes(df, require_cpl=False, require_ik=False, require_cpmk=Fal
         df = clean_code_column(df, "Kode IK")
         if require_ik:
             df = df[df["Kode IK"].notna()]
-            df = df[df["Kode IK"].str.match(r"^IK\d+(\.\d+)?$", na=False)]
+            df = df[df["Kode IK"].map(is_valid_ik_code)]
 
     if "Kode CPMK" in df.columns:
         df = clean_code_column(df, "Kode CPMK")
         if require_cpmk:
             df = df[df["Kode CPMK"].notna()]
-            df = df[df["Kode CPMK"].str.match(r"^CPMK\d+(\.\d+)?$", na=False)]
+            df = df[df["Kode CPMK"].map(is_valid_cpmk_code)]
 
     return df
 
@@ -4467,12 +4499,14 @@ def sort_ik_key(value):
 
 
 def cpmk_sort_key(code):
-    match = re.match(r"CPMK(\d+)(?:\.(\d+))?", str(code).strip().upper())
+    text = str(code).strip().upper()
+    match = re.search(r"CPMK\s*[-_]?\s*(\d+)(?:\s*\.\s*(\d+))?", text)
     if not match:
-        return (999, 999)
+        return ("", 999, 999)
+    prefix = text[: match.start()].strip(" -_")
     major = int(match.group(1))
     minor = int(match.group(2)) if match.group(2) else 0
-    return (major, minor)
+    return (prefix, major, minor)
 
 
 def semester_kurikulum_label(value: object) -> str:

@@ -5607,8 +5607,24 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
         st.info("Tidak ada data CPMK dengan Kode CPL, Kode IK, dan Kode CPMK valid untuk Tren IK.")
         return
     cpl_options = sorted(df["Kode CPL"].dropna().unique().tolist(), key=sort_cpl_key)
-    selected_cpl = st.selectbox("Pilih Kode CPL", cpl_options, key="trend_ik_cpl_final")
-    filtered = df[df["Kode CPL"] == selected_cpl].copy()
+    all_cpl_label = "Semua CPL"
+    selected_cpl = st.selectbox(
+        "Pilih Kode CPL", [all_cpl_label] + cpl_options, key="trend_ik_cpl_final"
+    )
+    show_all_cpl = selected_cpl == all_cpl_label
+    if show_all_cpl:
+        filtered = df.copy()
+        chart_scope = "semua CPL"
+    else:
+        filtered = df[df["Kode CPL"] == selected_cpl].copy()
+        chart_scope = selected_cpl
+    ik_to_cpl = (
+        filtered.dropna(subset=["Kode IK"])
+        .assign(_sort_cpl=lambda frame: frame["Kode CPL"].map(sort_cpl_key))
+        .sort_values("_sort_cpl")
+        .drop_duplicates("Kode IK")
+        .set_index("Kode IK")["Kode CPL"]
+    )
     value_col = pick_existing_column(
         filtered,
         [
@@ -5672,6 +5688,7 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
     grouped["Kriteria CPMK"] = pd.Categorical(grouped["Kriteria CPMK"], categories=category_order, ordered=True)
     grouped["_sort_ik"] = grouped["Kode IK"].map(sort_ik_key)
     grouped = grouped.sort_values(["_sort_ik", "Kriteria CPMK"])
+    grouped["Kode CPL"] = grouped["Kode IK"].map(ik_to_cpl)
     percent_check = grouped.groupby("Kode IK")["Persentase Komposisi CPMK (%)"].sum().round(2)
     invalid_percent = percent_check[(percent_check - 100).abs() > 0.05]
     if not invalid_percent.empty:
@@ -5687,15 +5704,21 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
         color="Kriteria CPMK",
         text=grouped["Persentase Komposisi CPMK (%)"].round(1),
         color_discrete_map=ACHIEVEMENT_COLORS,
-        category_orders={"Kriteria CPMK": category_order},
-        title=f"Distribusi Ketercapaian CPMK berdasarkan IK pada {selected_cpl}",
+        category_orders={
+            "Kriteria CPMK": category_order,
+            "Kode IK": sorted(grouped["Kode IK"].dropna().unique().tolist(), key=sort_ik_key),
+        },
+        hover_data={"Kode CPL": True} if show_all_cpl else None,
+        title=f"Distribusi Ketercapaian CPMK berdasarkan IK pada {chart_scope}",
     )
     fig.update_traces(texttemplate="%{text:.1f}%", textposition="inside")
     fig.update_layout(barmode="stack")
+    if show_all_cpl:
+        fig.update_layout(height=560, xaxis_tickangle=-45)
     fig.update_yaxes(range=[0, 100], title="Komposisi CPMK (%)")
     st.plotly_chart(fig, width="stretch", theme=None)
 
-    pivot = grouped.pivot_table(
+    pivot = grouped.drop(columns=["Kode CPL"]).pivot_table(
         index="Kode IK",
         columns="Kriteria CPMK",
         values="Jumlah CPMK",
@@ -5709,7 +5732,12 @@ def render_trend_ik(trend_ik: pd.DataFrame) -> None:
     pivot["Total CPMK"] = pivot[category_order].sum(axis=1)
     pivot["_sort_ik"] = pivot["Kode IK"].map(sort_ik_key)
     pivot = pivot.sort_values("_sort_ik").drop(columns=["_sort_ik"])
-    st.dataframe(format_display(pivot[["Kode IK", "Total CPMK"] + category_order]), width="stretch", hide_index=True)
+    pivot.insert(0, "Kode CPL", pivot["Kode IK"].map(ik_to_cpl))
+    st.dataframe(
+        format_display(pivot[["Kode CPL", "Kode IK", "Total CPMK"] + category_order]),
+        width="stretch",
+        hide_index=True,
+    )
 
 
 def render_student_cpl_radar(

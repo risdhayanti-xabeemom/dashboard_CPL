@@ -125,6 +125,19 @@ Parameter yang digunakan:
 
 Nama parameter lama `Batas Nilai Minimum` dan `Target Ketercapaian CPL` tetap didukung.
 
+## Rumus Capaian CPMK, IK, dan CPL
+
+Rumus mengikuti file "Peta CPL-IK-CPMK D3 TE 2025/2026" (metode jumlah MK pembawa IK) dan ada di `rumus_ik_cpl.py`:
+
+- Bobot IK = jumlah MK yang membawa IK / total jumlah MK semua IK (dihitung dari `Mapping_CPMK`).
+- Bobot IK dalam CPL = bobot IK / jumlah bobot IK pada CPL tersebut.
+- Bobot CPMK di MK = jumlah bobot IK yang diukur CPMK / jumlah bobot IK semua CPMK di MK itu x 100 (kolom `Bobot CPMK Rumus (%)` di Rekap CPMK).
+- Nilai CPMK mahasiswa dihitung per kode MK + kode CPMK, jadi kode lama seperti `CPMK1.1` yang dipakai banyak MK tidak tercampur.
+- Nilai IK mahasiswa = rata-rata nilai CPMK yang mengukur IK di tiap MK, lalu rata-rata antar MK pembawa (setiap MK dihitung sekali).
+- Nilai CPL mahasiswa = rata-rata nilai IK berbobot "bobot IK dalam CPL". Radar CPL memakai rumus yang sama.
+
+Satu CPMK yang mengukur beberapa IK (Magang Industri, Proyek Akhir) boleh ditulis `IK7.1, IK8.2` dalam satu sel `Kode IK`, atau sebagai beberapa baris.
+
 ## Mode Single Semester
 
 Gunakan mode ini untuk alur lama:

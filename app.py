@@ -12,6 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import rumus_ik_cpl
 from neobrutal import apply_theme, badge
 from neobrutal_plotly import apply_plotly_theme
 
@@ -682,7 +683,7 @@ def data_cache_signature(data: Dict[str, pd.DataFrame]) -> str:
 # Naikkan angka ini setiap kali cara hitung berubah. Cache Streamlit hanya melihat kode fungsi
 # yang di-cache, bukan fungsi yang dipanggilnya, sehingga tanpa versi ini file yang sama tetap
 # memakai hasil hitung lama sampai app di-reboot.
-CALCULATION_VERSION = "2026-11-05.1"
+CALCULATION_VERSION = "2026-11-13.1"
 
 
 @st.cache_data(show_spinner="Menghitung capaian CPL, IK, dan CPMK...")
@@ -1206,11 +1207,12 @@ def validate_workbook(data: Dict[str, pd.DataFrame], label: str = "file") -> Lis
             + "."
         )
 
-    missing_ik = sorted(
-        code
-        for code in set(mapping["Kode IK"].dropna()) - set(master_ik["Kode IK"].dropna())
-        if code
-    )
+    # Satu sel Kode IK boleh berisi beberapa IK (mis. "IK7.1, IK8.2" untuk Magang/PA).
+    mapping_ik = {
+        code for cell in mapping["Kode IK"].dropna() for code in rumus_ik_cpl.split_ik_codes(cell)
+    }
+    master_ik_codes = {rumus_ik_cpl.canonical_ik(code) for code in master_ik["Kode IK"].dropna()}
+    missing_ik = sorted(code for code in mapping_ik - master_ik_codes if code)
     if missing_ik:
         errors.append(
             f"{label}: Kode IK pada 'Mapping_CPMK' belum ada di 'Master_IK': "
@@ -1849,11 +1851,16 @@ def build_student_cpmk_df(nilai: pd.DataFrame) -> pd.DataFrame:
     if student_keys is None:
         nilai_valid["_Mahasiswa_Key"] = nilai_valid.index.astype(str)
         student_keys = ["_Mahasiswa_Key"]
-    group_keys = student_keys + [
-        column
-        for column in ["Kode CPMK", "Kode CPL", "Kode IK"]
-        if column in nilai_valid.columns
-    ]
+    # Nilai CPMK mahasiswa dihitung per MK + CPMK. Kode CPMK lama (CPMK1.1) dipakai di banyak MK,
+    # dan satu CPMK bisa mengukur beberapa IK, jadi CPL/IK tidak ikut menjadi kunci.
+    if "Kode MK" in nilai_valid.columns:
+        group_keys = student_keys + ["Kode MK", "Kode CPMK"]
+    else:
+        group_keys = student_keys + [
+            column
+            for column in ["Kode CPMK", "Kode CPL", "Kode IK"]
+            if column in nilai_valid.columns
+        ]
     label_columns = [
         column
         for column in [
@@ -1910,11 +1917,14 @@ def calculate_rekap_cpmk(
     mapping: pd.DataFrame, nilai: pd.DataFrame, batas_nilai_minimum: float
 ) -> pd.DataFrame:
     student_cpmk = build_student_cpmk_df(nilai)
-    group_keys = [
-        column
-        for column in ["Kode CPMK", "Kode CPL", "Kode IK"]
-        if column in student_cpmk.columns
-    ]
+    if {"Kode MK", "Kode CPMK"}.issubset(student_cpmk.columns) and "Kode MK" in mapping.columns:
+        group_keys = ["Kode MK", "Kode CPMK"]
+    else:
+        group_keys = [
+            column
+            for column in ["Kode CPMK", "Kode CPL", "Kode IK"]
+            if column in student_cpmk.columns
+        ]
     if not group_keys and "Kode CPMK" in student_cpmk.columns:
         group_keys = ["Kode CPMK"]
 
@@ -1982,6 +1992,7 @@ def calculate_rekap_cpmk(
         "Bobot_CPMK_Bersih",
     ]
     mapping_unique_key = [
+        "Kode MK",
         "Kode CPMK",
         "Kode CPL",
         "Kode IK",
@@ -1999,8 +2010,18 @@ def calculate_rekap_cpmk(
         mapping_unique = mapping_unique.drop_duplicates(subset=mapping_unique_key)
     if "Bobot_CPMK_Bersih" not in mapping_unique.columns:
         mapping_unique["Bobot_CPMK_Bersih"] = clean_weight_series(mapping_unique.get("Bobot CPMK", 1))
+    # Bobot CPMK menurut rumus baru (jumlah MK pembawa IK), ditampilkan di Rekap CPMK.
+    rumus_bobot = rumus_ik_cpl.cpmk_weights(mapping)
+    if not rumus_bobot.empty and {"Kode MK", "Kode CPMK"}.issubset(mapping_unique.columns):
+        mapping_unique["_MK"] = mapping_unique["Kode MK"].map(normalize_code)
+        mapping_unique["_CPMK"] = mapping_unique["Kode CPMK"].map(normalize_code)
+        mapping_unique = mapping_unique.merge(
+            rumus_bobot.rename(columns={"Kode MK": "_MK", "Kode CPMK": "_CPMK"}),
+            on=["_MK", "_CPMK"],
+            how="left",
+        ).drop(columns=["_MK", "_CPMK"])
 
-    merge_keys = [key for key in mapping_unique_key if key in grouped.columns]
+    merge_keys = [key for key in group_keys if key in grouped.columns and key in mapping_unique.columns]
     if not merge_keys:
         merge_keys = ["Kode CPMK"]
     rekap = mapping_unique.merge(grouped, on=merge_keys, how="left", suffixes=("", "_Nilai"))
@@ -4358,6 +4379,7 @@ def calculate_all(data, *args, **kwargs):
         target_cpl,
         prepared["Nilai_CPMK"],
         prepared["Mapping_CPMK"],
+        master_ik=prepared["Master_IK"],
     )
 
     for key in ["rekap_ik", "Rekap IK"]:
@@ -4716,13 +4738,15 @@ def _final_cpl_master(master_cpl: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_rekap_ik_from_students(nilai_df, mapping_df, master_ik, target_ketercapaian):
-    student_ik = calculate_student_ik_table_from_frames(nilai_df, mapping_df)
+    # Rumus baru: nilai IK = rata-rata per MK pembawa IK (lihat rumus_ik_cpl.py).
+    student_ik = rumus_ik_cpl.student_ik(nilai_df, mapping_df, master_ik)
     master = master_ik.copy() if master_ik is not None else pd.DataFrame()
     for column in ["Kode CPL", "Kode IK", "Notasi IK", "Rumusan IK"]:
         if column not in master.columns:
             master[column] = ""
     master["Kode CPL"] = master["Kode CPL"].map(canonical_cpl_radar_code)
     master = filter_valid_codes(master, require_cpl=True, require_ik=True)
+    master["Kode IK"] = master["Kode IK"].map(rumus_ik_cpl.canonical_ik)
     master = master[["Kode CPL", "Kode IK", "Notasi IK", "Rumusan IK"]].drop_duplicates(
         ["Kode CPL", "Kode IK"]
     )
@@ -4779,12 +4803,22 @@ def calculate_rekap_ik_from_students(nilai_df, mapping_df, master_ik, target_ket
     rekap["Kriteria"] = rekap["Capaian IK"].apply(classify_achievement)
     rekap["Status"] = rekap["Capaian IK"].apply(classify_status_by_score)
     rekap["Target"] = target_ketercapaian
-    rekap["Total Bobot CPMK"] = 1
+    weights = rumus_ik_cpl.ik_weights(mapping_df, master_ik)
+    rekap = rekap.drop(columns=["Jumlah MK Pembawa", "Bobot IK (%)", "Bobot dalam CPL (%)"], errors="ignore")
+    rekap = rekap.merge(weights.drop(columns=["Kode CPL"]), on="Kode IK", how="left")
+    rekap["Jumlah MK Pembawa"] = pd.to_numeric(rekap["Jumlah MK Pembawa"], errors="coerce").fillna(0).astype(int)
+    for column in ["Bobot IK (%)", "Bobot dalam CPL (%)"]:
+        rekap[column] = pd.to_numeric(rekap[column], errors="coerce").fillna(0.0)
+    # Dipakai sebagai bobot IK saat CPL dihitung dari Rekap IK (tanpa data mahasiswa).
+    rekap["Total Bobot CPMK"] = rekap["Jumlah MK Pembawa"]
     ordered_columns = [
         "Kode CPL",
         "Kode IK",
         "Notasi IK",
         "Rumusan IK",
+        "Jumlah MK Pembawa",
+        "Bobot IK (%)",
+        "Bobot dalam CPL (%)",
         "Capaian IK",
         "Jumlah Mahasiswa",
         "Jumlah Mahasiswa Mencapai",
@@ -4798,7 +4832,9 @@ def calculate_rekap_ik_from_students(nilai_df, mapping_df, master_ik, target_ket
     return rekap[ordered_columns].sort_values(["Kode CPL", "Kode IK"]).reset_index(drop=True)
 
 
-def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=None, mapping_cpmk=None):
+def calculate_rekap_cpl(
+    rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=None, mapping_cpmk=None, master_ik=None
+):
     rekap = _final_cpl_master(master_cpl)
     rekap["Rata-rata Nilai CPL"] = 0.0
     rekap["Jumlah Mahasiswa"] = 0
@@ -4806,11 +4842,11 @@ def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=No
     rekap["Persentase Ketercapaian (%)"] = 0.0
 
     if nilai_cpmk is not None and mapping_cpmk is not None:
-        student_source = prepare_student_cpl_source_from_frames(nilai_cpmk, mapping_cpmk)
-        student_cpl = calculate_student_cpl_table_from_source(student_source)
+        # Rumus baru: nilai CPL = rata-rata nilai IK berbobot "bobot IK dalam CPL".
+        student_cpl = rumus_ik_cpl.student_cpl(nilai_cpmk, mapping_cpmk, master_ik)
         if not student_cpl.empty:
             student_cpl = student_cpl.copy()
-            student_cpl["Kode CPL"] = student_cpl["Kode CPL Radar"].map(canonical_cpl_radar_code)
+            student_cpl["Kode CPL"] = student_cpl["Kode CPL"].map(canonical_cpl_radar_code)
             student_cpl = filter_valid_codes(student_cpl, require_cpl=True)
             student_cpl["Nilai CPL"] = pd.to_numeric(student_cpl["Nilai CPL"], errors="coerce").fillna(0).clip(0, 100)
             summary = (
@@ -4850,16 +4886,18 @@ def calculate_rekap_cpl(rekap_ik, master_cpl, target_ketercapaian, nilai_cpmk=No
         percent_col = _final_percent_column(ik) or "Capaian IK"
         ik["Capaian IK"] = _final_numeric_series(ik, "Capaian IK").clip(0, 100)
         ik[percent_col] = pd.to_numeric(ik[percent_col], errors="coerce").fillna(0).clip(0, 100)
-        summary = (
-            ik.groupby("Kode CPL", dropna=False)
-            .agg(
-                **{
-                    "Rata-rata Nilai CPL": ("Capaian IK", "mean"),
-                    "Persentase Ketercapaian (%)": (percent_col, "mean"),
-                }
-            )
-            .reset_index()
-        )
+        if "Bobot dalam CPL (%)" in ik.columns:
+            ik["_w"] = pd.to_numeric(ik["Bobot dalam CPL (%)"], errors="coerce").fillna(0)
+        else:
+            ik["_w"] = 1.0
+        ik.loc[ik["_w"] <= 0, "_w"] = 0
+        ik["_w"] = ik.groupby("Kode CPL")["_w"].transform(lambda w: w if w.sum() > 0 else 1)
+        ik["_nilai_w"] = ik["Capaian IK"] * ik["_w"]
+        ik["_persen_w"] = ik[percent_col] * ik["_w"]
+        summary = ik.groupby("Kode CPL", dropna=False)[["_nilai_w", "_persen_w", "_w"]].sum().reset_index()
+        summary["Rata-rata Nilai CPL"] = summary["_nilai_w"] / summary["_w"]
+        summary["Persentase Ketercapaian (%)"] = summary["_persen_w"] / summary["_w"]
+        summary = summary[["Kode CPL", "Rata-rata Nilai CPL", "Persentase Ketercapaian (%)"]]
         rekap = rekap.drop(
             columns=["Rata-rata Nilai CPL", "Persentase Ketercapaian (%)"], errors="ignore"
         ).merge(summary, on="Kode CPL", how="left")
@@ -5876,6 +5914,20 @@ def render_student_cpl_radar(
 
     table = detail[["Kode CPL", "Rumusan CPL", "Nilai CPL Mahasiswa", "Kriteria", "Status"]].copy()
     st.dataframe(format_display(table), width="stretch", hide_index=True)
+
+
+def calculate_student_cpl_table(data):
+    """Nilai CPL per mahasiswa untuk radar, dengan rumus yang sama seperti Rekap CPL."""
+    prepared = prepare_data(data)
+    result = rumus_ik_cpl.student_cpl(
+        prepared["Nilai_CPMK"], prepared["Mapping_CPMK"], prepared.get("Master_IK")
+    )
+    if result.empty:
+        return pd.DataFrame(columns=["NIM", "Nama Mahasiswa", "Kode CPL Radar", "Nilai CPL"])
+    result = result.copy()
+    result["Kode CPL Radar"] = result["Kode CPL"].map(canonical_cpl_radar_code)
+    result = result[result["Kode CPL Radar"].isin(CPL_RADAR_CODES)]
+    return result.drop(columns=["Kode CPL"]).reset_index(drop=True)
 
 
 if __name__ == "__main__":
